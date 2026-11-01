@@ -39,3 +39,8 @@ coverage.out
 
 # macOS
 **/.DS_Store
+
+# 本地插件交付配置、备份和构建状态
+.local/
+__pycache__/
+*.py[cod]

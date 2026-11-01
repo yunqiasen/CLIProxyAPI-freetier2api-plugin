@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""Local, opt-in FreeTier plugin delivery. See --help."""
+import os
+from pathlib import Path
+import sys
+
+sys.dont_write_bytecode = True
+os.umask(0o077)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from local_delivery.cli import main
+
+if __name__ == '__main__':
+    raise SystemExit(main())
