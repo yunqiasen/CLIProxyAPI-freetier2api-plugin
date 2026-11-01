@@ -1,6 +1,9 @@
 import hashlib
 import importlib.util
 import json
+import os
+import stat
+from unittest.mock import patch
 from pathlib import Path
 import subprocess
 import sys
@@ -22,7 +25,7 @@ class Runtime:
         self.puts = []
         self.accept = True
 
-    def snapshot(self):
+    def snapshot(self, **_options):
         return {'identity': self.identity, 'version': self.version,
                 'path': str(self.path), 'selector': self.version,
                 'credentials': ['unchanged'], 'models': ['alias'], 'config': 'same',
@@ -31,7 +34,7 @@ class Runtime:
 
     def select(self, version):
         self.puts.append(version)
-        if self.accept or version == '0.1.23':
+        if self.accept or version == '0.1.23' or '-rollback.' in version:
             self.version = version
             self.path = self.plugin_dir / f'freetier2api-v{version}.so'
 
@@ -119,7 +122,7 @@ class PublishTests(unittest.TestCase):
         self.runtime.accept = False
         with self.assertRaisesRegex(RuntimeError, 'version mismatch'):
             self.publisher.publish()
-        self.assertEqual(self.runtime.version, '0.1.23')
+        self.assertTrue(self.runtime.version.startswith('0.1.23-rollback.'))
         self.assertEqual(self.publisher.status()['phase'], 'rolled_back')
         self.assertIn('skipped', self.publisher.publish())
 
@@ -197,6 +200,31 @@ class PublishTests(unittest.TestCase):
         result = self.publisher.publish()
         self.assertEqual(result['runtime_identity'], 'new-process')
         self.assertEqual(len(self.runtime.puts), count)
+
+    def test_backup_sync_failure_prevents_any_runtime_selection(self):
+        real_sync = os.fsync
+        def fault(fd):
+            if '/backups/' in os.readlink('/proc/self/fd/' + str(fd)):
+                raise OSError('fixture backup sync failure')
+            return real_sync(fd)
+        with patch('os.fsync', side_effect=fault):
+            with self.assertRaisesRegex(OSError, 'backup sync'):
+                self.publisher.publish()
+        self.assertEqual(self.runtime.puts, [])
+        self.assertEqual(self.runtime.version, '0.1.23')
+
+    def test_failed_backup_directory_sync_is_retried_before_any_selection(self):
+        real_sync = os.fsync
+        def fault(fd):
+            path = os.readlink('/proc/self/fd/' + str(fd))
+            if '/backups' in path and stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError('fixture directory sync failure')
+            return real_sync(fd)
+        with patch('os.fsync', side_effect=fault):
+            for _ in range(2):
+                with self.assertRaisesRegex(OSError, 'directory sync'):
+                    self.publisher.publish(retry=True)
+        self.assertEqual(self.runtime.puts, [])
 
 if __name__ == '__main__':
     unittest.main()

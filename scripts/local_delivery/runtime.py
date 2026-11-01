@@ -116,32 +116,57 @@ print(json.dumps(rows))"""
         except (OSError, ValueError):
             raise RuntimeError(f'CPA maintenance {method} {path}: response not verified') from None
 
-    def snapshot(self):
+    def snapshot(self, *, control_only=False, known=()):
         identity = self.identity()
         cfg = self.request('/v8/management/config')
         plugin_cfg = cfg.get('plugins', {}).get('configs', {}).get('freetier2api', {})
         matches = [p for p in self.request('/v8/management/plugins')['plugins'] if p['id'] == 'freetier2api']
-        if len(matches) != 1 or not matches[0].get('registered') or not matches[0].get('effective_enabled'):
+        if len(matches) != 1 or (not control_only and
+                (not matches[0].get('registered') or not matches[0].get('effective_enabled'))):
             raise RuntimeError('FreeTier plugin is not enabled and registered')
         plugin = matches[0]
-        metadata_version = normalize(plugin.get('metadata', {}).get('version'))
-        filename = PurePosixPath(plugin.get('path', '')).name
+        metadata_version = normalize((plugin.get('metadata') or {}).get('version'))
+        missing_registration = control_only and not plugin.get('registered')
+        active_path = plugin.get('active_path', '')
+        if not missing_registration and not active_path:
+            raise RuntimeError('CPA does not expose registered active_path; update the host first')
+        filename = PurePosixPath(active_path if not missing_registration else plugin.get('path', '')).name
         match = re.fullmatch(r'freetier2api-v([0-9][0-9A-Za-z.+-]*)\.so', filename)
         if not match:
-            raise RuntimeError('Unexpected plugin discovery path')
+            raise RuntimeError('Unexpected registered plugin path')
         generation = match.group(1)
-        if generation != metadata_version and not generation.startswith(metadata_version + '-rollback.'):
-            generation = metadata_version
-        version = generation
-        if not re.fullmatch(r'[0-9][0-9A-Za-z.+-]*', version):
-            raise RuntimeError('Invalid registered plugin version')
-        # Discovery path can describe a failed candidate: select the known metadata version.
-        path = self.plugin_dir / f'freetier2api-v{version}.so'
-        if not path.is_file() or path.is_symlink():
-            raise RuntimeError('Registered plugin file is missing; recovery needs inspection')
-        st = path.stat()
-        if (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino) not in self.native_images:
-            raise RuntimeError('Discovered plugin file is not mapped by this CPA process')
+        if not missing_registration and generation != metadata_version and not generation.startswith(metadata_version + '-rollback.'):
+            raise RuntimeError('Registered plugin path and embedded version disagree')
+        candidates = [generation]
+        # With no registered instance, recovery may inspect known mapped files,
+        # but acceptance always uses the host's actual registered active_path.
+        if missing_registration:
+            candidates.extend(release['version'] for release in known if release)
+        path = None
+        for version in dict.fromkeys(candidates):
+            if not re.fullmatch(r'[0-9][0-9A-Za-z.+-]*', version):
+                continue
+            candidate_path = self.plugin_dir / f'freetier2api-v{version}.so'
+            if candidate_path.is_symlink() or not candidate_path.is_file():
+                continue
+            st = candidate_path.stat()
+            if (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino) in self.native_images:
+                path = candidate_path
+                break
+        if path is None:
+            raise RuntimeError('Registered plugin file is missing or not mapped by this CPA process')
+        selector = normalize(plugin_cfg.get('store', {}).get('version', ''))
+        stable_config = copy.deepcopy(cfg)
+        stable_store = stable_config['plugins']['configs']['freetier2api'].get('store', {})
+        stable_store.pop('version', None)
+        if not stable_store:
+            stable_config['plugins']['configs']['freetier2api'].pop('store', None)
+        result = {'identity': identity, 'version': version, 'metadata_version': metadata_version,
+                  'mapped_images': self.mapped_images, 'path': str(path), 'selector': selector,
+                  'artifact_sha256': digest(path), 'config': fingerprint(stable_config)}
+        if control_only:
+            # Recovery must not depend on a broken candidate's console or models.
+            return result
         keys = cfg.get('access', {}).get('api-keys', [])
         if not keys or not isinstance(keys[0], str):
             raise RuntimeError('An existing CPA API key is needed for the local model inventory')
@@ -151,17 +176,9 @@ print(json.dumps(rows))"""
                               for item in self.request('/v8/management/credentials')['files']], key=lambda item: item['name'])
         models = sorted(item['id'] for item in self.request('/v1/models', api=True)['data'])
         console = self.request('/v0/resource/plugins/freetier2api/console', raw=True)
-        selector = normalize(plugin_cfg.get('store', {}).get('version', ''))
-        stable_config = copy.deepcopy(cfg)
-        stable_store = stable_config['plugins']['configs']['freetier2api'].get('store', {})
-        stable_store.pop('version', None)
-        if not stable_store:
-            stable_config['plugins']['configs']['freetier2api'].pop('store', None)
-        return {'identity': identity, 'version': version, 'metadata_version': metadata_version,
-                'mapped_images': self.mapped_images, 'path': str(path), 'selector': selector,
-                'artifact_sha256': digest(path),
-                'config': fingerprint(stable_config), 'credentials': fingerprint(credentials),
-                'models': fingerprint(models), 'console_sha256': hashlib.sha256(console).hexdigest()}
+        result.update(credentials=fingerprint(credentials), models=fingerprint(models),
+                      console_sha256=hashlib.sha256(console).hexdigest())
+        return result
 
     def select(self, version):
         if not re.fullmatch(r'[0-9][0-9A-Za-z.+-]*', version):

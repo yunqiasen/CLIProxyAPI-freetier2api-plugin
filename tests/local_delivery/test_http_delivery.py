@@ -36,6 +36,10 @@ class HttpDeliveryTests(unittest.TestCase):
         self.metadata = 'v0.1.23'
         self.selector = '0.1.23'
         self.accept = True
+        self.break_console = False
+        self.lose_models = False
+        self.lose_registration = False
+        self.reject_rollback = False
         self.calls = []
         self.owner_note = 'keep this credential label'
         fixture = self
@@ -51,15 +55,19 @@ class HttpDeliveryTests(unittest.TestCase):
                         'configs': {'freetier2api': {'enabled': True, 'note': 'keep',
                                                    'store': {'version': fixture.selector}}}}}
                 elif self.path == '/v8/management/plugins':
-                    data = {'plugins': [{'id': 'freetier2api', 'registered': True, 'effective_enabled': True,
+                    data = {'plugins': [{'id': 'freetier2api', 'registered': not (fixture.lose_registration and '-fork.' in fixture.metadata), 'effective_enabled': True,
                         'path': '/CLIProxyAPI/logs/plugins/linux/amd64/freetier2api-v' + fixture.selector + '.so',
-                        'metadata': {'version': fixture.metadata}}]}
+                        'active_path': '/CLIProxyAPI/logs/plugins/linux/amd64/freetier2api-v' + fixture.generation + '.so',
+                        'metadata': None if fixture.lose_registration and '-fork.' in fixture.metadata else {'version': fixture.metadata}}]}
                 elif self.path == '/v8/management/credentials':
                     data = {'files': [{'name': 'credential.json', 'type': 'freetier', 'disabled': False,
                                         'note': fixture.owner_note}]}
                 elif self.path == '/v1/models':
-                    data = {'data': [{'id': 'custom-alias'}]}
+                    data = {'data': [] if fixture.lose_models and '-fork.' in fixture.metadata else [{'id': 'custom-alias'}]}
                 elif self.path == '/v0/resource/plugins/freetier2api/console':
+                    if fixture.break_console and '-fork.' in fixture.metadata:
+                        self.send_error(500)
+                        return
                     self.send_response(200)
                     self.end_headers()
                     self.wfile.write(b'<html>console</html>')
@@ -79,7 +87,7 @@ class HttpDeliveryTests(unittest.TestCase):
                     return
                 value = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
                 fixture.selector = value
-                if fixture.accept or value == '0.1.23' or '-rollback.' in value:
+                if not (fixture.reject_rollback and '-rollback.' in value) and (fixture.accept or value == '0.1.23' or '-rollback.' in value):
                     fixture.generation = value
                     fixture.metadata = value.split('-rollback.')[0]
                 self.send_response(200)
@@ -95,7 +103,9 @@ class HttpDeliveryTests(unittest.TestCase):
         self.runtime.key = 'FIXTURE-MANAGEMENT'
         def identity():
             st = (self.installed / f'freetier2api-v{self.generation}.so').stat()
-            self.runtime.native_images = {(os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)}
+            # NODELETE may keep mapped but unsuccessfully registered candidates.
+            self.runtime.native_images = {(os.major(f.stat().st_dev), os.minor(f.stat().st_dev), f.stat().st_ino)
+                                          for f in self.installed.glob('*.so')}
             self.runtime.mapped_images = 1
             return 'fixture:pid:start'
         self.runtime.identity = identity
@@ -129,12 +139,55 @@ class HttpDeliveryTests(unittest.TestCase):
         self.accept = False
         with self.assertRaisesRegex(RuntimeError, 'verification'):
             self.publisher.publish()
-        self.assertEqual(self.selector, '0.1.23')
-        self.assertEqual(self.generation, '0.1.23')
+        self.assertTrue(self.selector.startswith('0.1.23-rollback.'))
+        self.assertEqual(self.generation, self.selector)
         self.assertEqual(self.publisher.status()['phase'], 'rolled_back')
         puts = sum(method == 'PUT' for method, _ in self.calls)
         self.assertIn('skipped', self.publisher.publish())
         self.assertEqual(sum(method == 'PUT' for method, _ in self.calls), puts)
+
+    def test_broken_candidate_console_does_not_block_control_plane_rollback(self):
+        self.break_console = True
+        with self.assertRaisesRegex(RuntimeError, 'verification'):
+            self.publisher.publish()
+        self.assertEqual(self.publisher.status()['phase'], 'rolled_back')
+        self.assertTrue(self.generation.startswith('0.1.23-rollback.'))
+
+    def test_candidate_model_loss_triggers_rollback_not_external_change_stop(self):
+        self.lose_models = True
+        with self.assertRaisesRegex(RuntimeError, 'verification'):
+            self.publisher.publish()
+        self.assertEqual(self.publisher.status()['phase'], 'rolled_back')
+        self.assertTrue(self.generation.startswith('0.1.23-rollback.'))
+
+    def test_missing_candidate_registration_still_allows_previous_code_recovery(self):
+        self.lose_registration = True
+        with self.assertRaisesRegex(RuntimeError, 'verification'):
+            self.publisher.publish()
+        self.assertEqual(self.publisher.status()['phase'], 'rolled_back')
+
+    def test_failed_candidate_after_rollback_finds_mapped_previous_generation(self):
+        self.publisher.publish()
+        self.publisher.rollback()
+        previous = self.generation
+        (self.repo / 'source').write_text('v2')
+        self.git('add', '.')
+        self.git('commit', '-qm', 'new candidate')
+        self.accept = False
+        with self.assertRaisesRegex(RuntimeError, 'verification'):
+            self.publisher.publish()
+        self.assertEqual(self.publisher.status()['phase'], 'rolled_back')
+        self.assertTrue(self.generation.startswith('0.1.23-rollback.'))
+        self.assertNotEqual(self.generation, previous)
+
+    def test_mapped_rollback_with_failed_registration_is_not_reported_restored(self):
+        self.accept = False
+        self.reject_rollback = True
+        with self.assertRaisesRegex(RuntimeError, 'verification'):
+            self.publisher.publish()
+        self.assertEqual(self.generation, '0.1.23')
+        self.assertTrue(self.selector.startswith('0.1.23-rollback.'))
+        self.assertEqual(self.publisher.status()['phase'], 'recovery_failed')
 
     def test_redirect_does_not_forward_management_credentials(self):
         # The installed opener deliberately contains a rejecting redirect policy.

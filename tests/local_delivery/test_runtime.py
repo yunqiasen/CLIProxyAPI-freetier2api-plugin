@@ -35,6 +35,7 @@ class RuntimeTests(unittest.TestCase):
         if path.endswith('/plugins'):
             return {'plugins': [{'id': 'freetier2api', 'registered': True, 'effective_enabled': True,
                                  'path': '/CLIProxyAPI/logs/plugins/linux/amd64/freetier2api-v0.1.23.so',
+                                 'active_path': '/CLIProxyAPI/logs/plugins/linux/amd64/freetier2api-v0.1.23.so',
                                  'metadata': {'version': self.version}}]}
         if path.endswith('/credentials'):
             return {'files': [{'name': 'sample.json', 'type': 'freetier', 'note': 'keep', 'status': 'mutable'}]}

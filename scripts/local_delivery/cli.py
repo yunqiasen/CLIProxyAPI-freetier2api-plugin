@@ -164,8 +164,11 @@ def emit(value, as_json=False):
     print('状态：' + labels.get(phase, phase) + ('；已暂停' if value.get('paused') else ''), flush=True)
     active = value.get('active', {})
     if active.get('version'):
-        print('版本：' + active['version'] + '；已观察：' + value.get('observed_version', '未知'), flush=True)
-        print('提交：' + active.get('commit', '')[:12], flush=True)
+        print('版本：' + value.get('observed_version', active['version']) + '（最近验证）', flush=True)
+        if value.get('phase') == 'active':
+            print('提交：' + active.get('commit', '')[:12], flush=True)
+        else:
+            print('最近发布提交：' + active.get('commit', '')[:12] + '（以当前状态为准）', flush=True)
     if value.get('source'):
         source = value['source']
         print('源码：' + (source['branch'] or '游离 HEAD') + ' ' + source['commit'][:12] +

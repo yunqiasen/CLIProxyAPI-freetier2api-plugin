@@ -1,5 +1,8 @@
 # FreeTier 2API Plugin
 
+> Local fork development: see [commit-triggered delivery and rollback](docs/local-delivery.md). Keep upstream on `main` and daily changes on `freetier2api_fork`.
+
+
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![CLIProxyAPI](https://img.shields.io/badge/CLIProxyAPI-Plugin-2496ED?style=flat)](https://github.com/router-for-me/CLIProxyAPI)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)

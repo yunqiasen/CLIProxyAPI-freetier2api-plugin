@@ -1,5 +1,8 @@
 # FreeTier 2API Plugin
 
+> 本地二开维护：见 [提交后自动加载与回滚](docs/local-delivery.md)。`main` 同步上游，`freetier2api_fork` 日常开发。
+
+
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![CLIProxyAPI](https://img.shields.io/badge/CLIProxyAPI-Plugin-2496ED?style=flat)](https://github.com/router-for-me/CLIProxyAPI)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
