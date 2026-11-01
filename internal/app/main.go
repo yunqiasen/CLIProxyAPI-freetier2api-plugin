@@ -61,6 +61,8 @@ func (a *App) HandleMethod(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodPluginReconfigure:
 		return a.handlePluginReconfigure(request)
 	case pluginabi.MethodPluginQuiesce:
+		a.lifecycleMu.Lock()
+		defer a.lifecycleMu.Unlock()
 		a.StopBackgroundWork()
 		return core.OKEnvelope(struct{}{})
 
@@ -159,6 +161,10 @@ func (a *App) handlePluginReconfigure(request []byte) ([]byte, error) {
 		}
 	}
 	a.applyModelCatalog(cfg)
+	// A host rollback resumes the registered instance after quiescing it.
+	if a.registered {
+		a.StartBackgroundWork()
+	}
 	logger.Info("reconfigured: realms=%v state_dir=%s", cfg.EnabledRealms, cfg.StateDir)
 	return core.OKEnvelope(a.Registration())
 }
