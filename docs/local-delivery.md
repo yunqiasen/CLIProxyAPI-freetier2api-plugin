@@ -113,3 +113,10 @@ python3 -m unittest discover -s tests/local_delivery -p 'test_*.py' -v
 # 原生业务测试需使用兼容的 Go/CGO 工具链
 CGO_ENABLED=1 go test ./... -count=1
 ```
+
+## 本机首次启用记录（2026-11-01）
+
+- 宿主已交付 `a2c3ea7a`，管理接口的 `active_path` 已在线确认；容器保持不变。
+- 首次手动加载提交 `1cde9b14c339` 已通过版本、文件、页面、模型与凭证检查；插件切换期间 CPA 进程保持不变。
+- `freetier2api-local-delivery.service` 已启用；后续确切加载提交以 `./scripts/dev-plugin status` 为准。
+- 本机验收证据存放于 `/home/div/1_Project_dir/AI/CPA/freetier2api/.local/evidence`，保持私有且不入库。账号凭证字节保持；插件已有模型缓存字段会自行更新，不把缓存哈希变化误报为凭证变更。
