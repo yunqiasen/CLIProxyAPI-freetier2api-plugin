@@ -24,7 +24,8 @@ AutoClaw当前实时目录：`zai_auto`、`zai_auto-fast`、`zai_glm-5.3-flash`�
 5. 测速可能被宿主和Qoder内层重试。可选request_stop沿RPC透传，借现有停止重试接口，只测一次且不附加凭证冷却。
 6. “90秒”只在插件本地context中，未跨原生RPC。页面现在真实取消fetch并解锁按钮，晚到结果不覆盖取消。
 7. lab的JSON-as-YAML被插件行解析器误读。准备脚本输出块状YAML，先核对自动任务均false；10:00历史日志确认国内MiniMax自动新领400点、AutoClaw自动新领200点，手动/checkin只验证已领幂等，不冒称手动新领取。
-8. 目录过渡发布器可能把旧active/skipped当成功。锁内固定批准完整commit，结果要求无skipped且active.commit匹配。
+8. 56账号正式UI验证发现首屏先等整池额度，模型表长时间空白。现在先显示模型、再查批量额度；空缓存刷新也完整返回Promise，保留鉴权串行止损。warm/cold DOM回归均通过。
+9. 目录过渡发布器可能把旧active/skipped当成功。锁内固定批准完整commit，结果要求无skipped且active.commit匹配。
 
 ## 检查与审查
 

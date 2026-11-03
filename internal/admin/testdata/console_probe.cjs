@@ -62,16 +62,18 @@ const models = [{id: 'minimax-m3', alias: 'my-model', scope_id: 'minimaxcodecn:m
   {id: 'disabled-model', vendor_id: 'minimaxcodecn', disabled: true},
   {id: 'minimax-m4', alias: 'second-model', vendor_id: 'minimaxcodecn'},
   {id: 'global-only', vendor_id: 'minimaxcodeglobal'}];
-const calls = []; let probeResolve; let statusFailure = null;
+let coldStartup=process.argv[3]==='cold';let startupRefreshResolve;
+const calls = []; let probeResolve; let statusFailure = null; let startupQuotaResolve;
 global.fetch = async (url, options) => {
   const path = new URL(url, 'https://fixture.local').pathname.replace('/v0/management/plugins/freetier2api', '');
   const body = options.body ? JSON.parse(options.body) : null; calls.push({path, method: options.method, body});
   let data;
   if (path === '/vendors') data = {vendors: [{id: 'minimaxcodecn', name: 'MiniMax CN'}, {id: 'minimaxcodeglobal', name: 'MiniMax Global'}]};
   else if (path === '/status') { if (statusFailure) throw new Error(statusFailure); data = {accounts, settings: {}}; }
-  else if (path === '/models') data = {models};
+  else if (path === '/models') data = {models: coldStartup ? [] : models};
+  else if(path === '/models/refresh') return new Promise(resolve=>{startupRefreshResolve=()=>{coldStartup=false;resolve({status:200,ok:true,json:async()=>({ok:true})})};});
   else if (path === '/accounts/alias') { accounts.find(account => account.file_id === body.file_id).alias = body.alias; data = {ok: true}; }
-  else if (path === '/quotas') data = {results: []};
+  else if (path === '/quotas') return new Promise(resolve => { startupQuotaResolve = () => resolve({status: 200, ok: true, json: async () => ({results: []})}); });
   else if (path === '/logs') data = {entries: []};
   else if (path === '/models/probe') return new Promise((resolve, reject) => { if (options.signal) options.signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), {name: "AbortError"})), {once: true}); probeResolve = data => resolve({status: 200, ok: true, json: async () => data}); });
   else throw new Error('unexpected request ' + path);
@@ -82,7 +84,14 @@ const probes = () => calls.filter(c => c.path === '/models/probe');
 (async () => {
   const script = page.match(/<script>([\s\S]*?)<\/script>/)[1]; vm.runInThisContext(script);
   await flush();
+  if(coldStartup){
+   assert.ok(startupRefreshResolve,'empty cache triggers the existing refresh');
+   assert.equal(calls.filter(c=>c.path.startsWith('/logs')||c.path==='/quotas').length,0,'cold refresh remains inside the serial auth gate');
+   startupRefreshResolve();await flush();
+  }
   assert.equal(probes().length, 0, 'page load must not execute a model');
+  assert.ok(nodes.get('models').children[0], 'model controls must load before the batch quota request completes');
+  if(startupQuotaResolve) startupQuotaResolve(); await flush();
   const table = nodes.get('models').children[0];
   const row = table.children.find(row => row.textContent.includes('my-model'));
   assert.ok(row, 'model row rendered');

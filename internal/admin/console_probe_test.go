@@ -18,9 +18,14 @@ func TestConsoleModelProbeDOM(t *testing.T) {
 	if err := os.WriteFile(pagePath, []byte(Page("/plugins/freetier2api")), 0600); err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command(node, "testdata/console_probe.cjs", pagePath).CombinedOutput()
-	if err != nil {
-		t.Fatalf("console probe DOM: %v\n%s", err, out)
+	for _, cache := range []string{"warm", "cold"} {
+		t.Run(cache, func(t *testing.T) {
+			out, err := exec.Command(node, "testdata/console_probe.cjs", pagePath, cache).CombinedOutput()
+			if err != nil {
+				t.Fatalf("console probe DOM: %v\n%s", err, out)
+			}
+			t.Log(string(out))
+		})
 	}
-	t.Log(string(out))
+
 }

@@ -2308,7 +2308,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   // 进入管理页就自动获取，用户不必先点按钮——首次安装或换机时缓存是空的，
   // 此时再打一次上游把它填上。
   function loadModels(autoRefresh) {
-    api("GET", "/models").then(function (data) {
+    return api("GET", "/models").then(function (data) {
       if (!data) return;
       allModels = (data && data.models) || [];
       renderModels();
@@ -2323,7 +2323,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       if (allModels.length || !autoRefresh || modelsLoaded) return;
       modelsLoaded = true;
       // 缓存为空：自动从上游拉一次（只做一次，避免失败时反复打上游）。
-      refreshModels(true);
+      return refreshModels(true);
     }).catch(function (err) { banner("err", err.message); });
   }
 
@@ -2338,7 +2338,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     modelsLoaded = true;        // 已手动刷新，不再触发首屏自动刷新
     modelsPollLeft = 2;
     if (!quiet) banner("ok", "正在从上游拉取模型清单…", 0);
-    api("POST", "/models/refresh", {}).then(function (data) {
+    return api("POST", "/models/refresh", {}).then(function (data) {
       var count = (data && data.models) || 0;
       if (!quiet) {
         banner(count ? "ok" : "warn",
@@ -2449,7 +2449,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
 
   function loadLogs(reset) {
     if (reset) { document.getElementById("logs").textContent = ""; logSeq = 0; }
-    api("GET", "/logs?since=" + logSeq + "&limit=200").then(function (payload) {
+    return api("GET", "/logs?since=" + logSeq + "&limit=200").then(function (payload) {
       if (!payload) return;
       appendLogs(payload.entries);
       if (payload.next) logSeq = payload.next;
@@ -3460,16 +3460,15 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   // 供应商表仍排第一：账号表与模型表的展示名都依赖它。
   function startConsole() {
     loadVendors().then(function () {
-      // 单步失败不应阻断后续模块；鉴权失败时 api() 闸门会挡下所有后续请求。
-      // loadQuotas 结束时会自己重拉账号表，首屏因此不必先 loadStatus：
-      // 先渲染一次「查询中」，再带着额度结果重渲染。
       return loadStatus().catch(function () { return null; });
     }).then(function () {
-      return loadQuotas(true).catch(function () { return null; });
+      // Keep auth checks serial, but render model controls before slow batch quotas.
+      return loadModels(true);
     }).then(function () {
-      loadModels(true);   // 进入页面自动获取模型清单
-      loadLogs(true);     // 进入页面自动拉一次日志
+      return loadLogs(true);
+    }).then(function () {
       syncLogPolling();
+      return loadQuotas(true).catch(function () { return null; });
     });
   }
 
