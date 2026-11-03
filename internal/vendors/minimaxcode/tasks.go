@@ -16,17 +16,13 @@ import (
 	"freetier2api-plugin/internal/logger"
 )
 
-// Checkin 执行账号每日签到（仅国际版支持）。
+// Checkin 执行账号每日签到（国内版与国际版共用协议，按区域选择端点）。
 func Checkin(ctx context.Context, cred *Credential, baseURLOverride string) (*core.CheckinResult, error) {
 	if cred == nil {
 		return nil, core.NewPluginError("credential_missing", "credential is nil", http.StatusUnauthorized)
 	}
-
-	if cred.Region == RegionCN {
-		return &core.CheckinResult{
-			Already: false,
-			Message: "国内版暂无签到活动",
-		}, nil
+	if strings.TrimSpace(cred.AccessToken) == "" {
+		return nil, core.NewPluginError("credential_missing", "credential missing access_token", http.StatusUnauthorized)
 	}
 
 	base := AgentHostFor(cred.Region, baseURLOverride)
@@ -42,34 +38,61 @@ func Checkin(ctx context.Context, cred *Credential, baseURLOverride string) (*co
 	}
 	defer func() { _ = statusResp.Body.Close() }()
 
-	if statusResp.StatusCode == http.StatusOK {
-		var statusRaw map[string]any
-		if errDec := json.NewDecoder(statusResp.Body).Decode(&statusRaw); errDec == nil {
-			// 业务码在 base_resp.status_code，且 invalid timezone_id 也是 HTTP 200。
-			// 只判 HTTP 状态会把明确的业务失败当成「今日未领取」。
-			if errBiz := signinBusinessError(statusRaw); errBiz != nil {
-				return nil, errBiz
-			}
-			coreMap := statusRaw
-			if data, ok := statusRaw["data"].(map[string]any); ok {
-				coreMap = data
-			}
-			if days, ok := coreMap["days"].([]any); ok {
-				for _, d := range days {
-					if dm, ok := d.(map[string]any); ok {
-						isToday, _ := dm["is_today"].(bool)
-						status := getInt(dm, "status")
-						// status == 3 表示今日已领取
-						if isToday && status == 3 {
-							return &core.CheckinResult{
-								Already: true,
-								Message: "今日已完成签到",
-							}, nil
-						}
-					}
+	if statusResp.StatusCode >= http.StatusBadRequest {
+		body, _ := io.ReadAll(io.LimitReader(statusResp.Body, 4096))
+		return nil, Classify(statusResp.StatusCode, string(body))
+	}
+
+	if statusResp.StatusCode != http.StatusOK {
+		return nil, core.NewPluginError("checkin_status_invalid", fmt.Sprintf("签到看板返回 HTTP %d，领取资格未确认", statusResp.StatusCode), http.StatusBadGateway)
+	}
+	var statusRaw map[string]any
+	if errDec := json.NewDecoder(statusResp.Body).Decode(&statusRaw); errDec != nil {
+		return nil, fmt.Errorf("decode checkin status response: %w", errDec)
+	}
+	if errBiz := signinBusinessError(statusRaw); errBiz != nil {
+		return nil, errBiz
+	}
+	boardMap := statusRaw
+	if data, ok := statusRaw["data"].(map[string]any); ok {
+		boardMap = data
+	}
+	days, ok := boardMap["days"].([]any)
+	if !ok {
+		return nil, core.NewPluginError("checkin_status_invalid", "签到看板缺少日历，领取资格未确认", http.StatusBadGateway)
+	}
+	if len(days) == 0 {
+		return &core.CheckinResult{NotRecorded: true, Message: "签到看板无可领活动（上游返回空日历）"}, nil
+	}
+	eligible := false
+	for _, d := range days {
+		dm, ok := d.(map[string]any)
+		if !ok {
+			continue
+		}
+		isToday, _ := dm["is_today"].(bool)
+		if !isToday {
+			continue
+		}
+		switch getInt(dm, "status") {
+		case 3:
+			return &core.CheckinResult{Already: true, Message: "今日已完成签到"}, nil
+		case 1:
+			message := "签到窗口未开启（上游未提供开启时间）"
+			if baseResp, ok := statusRaw["base_resp"].(map[string]any); ok {
+				if upstream := strings.TrimSpace(core.GetString(baseResp, "status_msg")); upstream != "" && !strings.EqualFold(upstream, "ok") {
+					message = "签到窗口未开启：" + upstream
 				}
 			}
+			return &core.CheckinResult{NotRecorded: true, Message: message}, nil
+		case 2:
+			eligible = true
+		default:
+			return nil, core.NewPluginError("checkin_status_invalid", "签到看板今日状态未知，领取资格未确认", http.StatusBadGateway)
 		}
+	}
+	if !eligible {
+		return nil, core.NewPluginError("checkin_status_invalid", "签到看板缺少今日状态，领取资格未确认", http.StatusBadGateway)
 	}
 
 	// 3. 领取签到积分
@@ -134,6 +157,9 @@ func signinBusinessError(payload map[string]any) error {
 		return nil
 	}
 	message := core.FirstNonEmpty(core.GetString(baseResp, "status_msg"), fmt.Sprintf("上游业务错误 %d", code))
+	if strings.Contains(strings.ToLower(message), "invalid access token") || isCredentialFailure(Classify(0, message)) {
+		return core.NewPluginError("upstream_credential", message, http.StatusUnauthorized)
+	}
 	return core.NewPluginError("upstream_business", message, http.StatusBadGateway)
 }
 

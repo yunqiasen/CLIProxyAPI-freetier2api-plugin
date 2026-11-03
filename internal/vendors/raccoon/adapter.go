@@ -120,10 +120,11 @@ func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
 //
 // 探测需要一把有效凭证；借不到就返回错误（不编清单）。
 func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, error) {
-	token := v.probeToken()
+	token, authIndex := v.probeToken(ctx)
 	if token == "" {
 		return nil, fmt.Errorf("no raccoon credential available for model probe")
 	}
+	ctx = hostbridge.WithAuthIndex(ctx, authIndex)
 	models, errModels := FetchModels(ctx, v.resolveLLMBase(), token)
 	if errModels != nil {
 		return nil, errModels
@@ -401,15 +402,15 @@ func (v *adapter) resolvePointsBase() string { return BaseURL(v.pointsBase, Defa
 func (v *adapter) resolveOrigin() string     { return BaseURL(v.origin, DefaultOrigin) }
 
 // probeToken 借一个本供应商的可用凭证取 access token（供模型探测用）。
-func (v *adapter) probeToken() string {
-	native, okNative := core.ProbeNativeCredential(v.Env, VendorID, func(cred *core.Credential) (*Credential, bool) {
+func (v *adapter) probeToken(ctx context.Context) (string, string) {
+	native, authIndex, okNative := core.ProbeNativeCredentialWithIndex(ctx, v.Env, VendorID, func(cred *core.Credential) (*Credential, bool) {
 		value, okValue := cred.Native.(*Credential)
 		return value, okValue
 	})
 	if !okNative || native == nil {
-		return ""
+		return "", ""
 	}
-	return native.AccessTokenValue()
+	return native.AccessTokenValue(), authIndex
 }
 
 // 编译期断言：适配器实际具备的供应商能力。

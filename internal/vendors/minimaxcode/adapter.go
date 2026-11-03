@@ -206,7 +206,8 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 	return LoginPoll(ctx, v.Env.Logins, state, v.baseURL)
 }
 
-func (v *adapter) SupportsCheckin() bool { return v.region == RegionGlobal }
+// 两个区域的签到接口均已实测：国内版证据见 2026-11-02 lab 记录。
+func (v *adapter) SupportsCheckin() bool { return true }
 
 // ConfigFields 声明 MiniMax Code 专属配置。
 func (v *adapter) ConfigFields() []pluginapi.ConfigField {

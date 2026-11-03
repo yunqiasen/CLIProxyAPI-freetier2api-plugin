@@ -2,6 +2,7 @@ package minimaxcode
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 
 	"freetier2api-plugin/internal/core"
@@ -102,5 +103,18 @@ func TestClassifySurvivesToPluginError(t *testing.T) {
 	}
 	if pluginErr.Retryable {
 		t.Fatal("credential failure must not rotate accounts")
+	}
+}
+
+func TestProbePreservesRawBodyWithoutChangingCredentialClassification(t *testing.T) {
+	body := `{"code":1001,"msg":"token expired","detail":"` + strings.Repeat("x", 400) + `"}`
+	classified := Classify(http.StatusBadRequest, body)
+	production := core.ToPluginError(classified).(*core.PluginError)
+	if production.HTTPStatus != http.StatusUnauthorized || production.Retryable {
+		t.Fatalf("production classification changed: %+v", production)
+	}
+	probe := core.ToProbeError(classified).(*core.PluginError)
+	if probe.HTTPStatus != http.StatusBadRequest || probe.Message != body {
+		t.Fatalf("probe lost raw response: %+v", probe)
 	}
 }

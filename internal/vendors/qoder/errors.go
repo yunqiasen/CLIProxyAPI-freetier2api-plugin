@@ -204,7 +204,9 @@ type UpstreamError struct {
 	Queue *QueueSignal
 }
 
-func (e *UpstreamError) Error() string { return e.Message }
+func (e *UpstreamError) Error() string           { return e.Message }
+func (e *UpstreamError) RawHTTPStatus() int      { return e.Status }
+func (e *UpstreamError) UpstreamMessage() string { return e.Detail }
 
 // FriendlyUpstreamError 把上游错误转成对客户端可读的消息；瞬时故障给出重试指引。
 // 返回 (message, errType)。与 hub friendly_upstream_error 逐句对齐。

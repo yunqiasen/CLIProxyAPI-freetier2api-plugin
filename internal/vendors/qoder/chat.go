@@ -902,7 +902,7 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if IsTransientTransport(err) && attempt < TransientMaxRetries {
+			if !core.IsModelProbe(ctx) && IsTransientTransport(err) && attempt < TransientMaxRetries {
 				logger.Info("transient transport error opening stream %s (try %d/%d): %s - retry in %ds",
 					fullURL, attempt+1, TransientMaxRetries+maxQueueWaits+1, err.Error(), attempt+1)
 				continue
@@ -916,6 +916,9 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 				return fmt.Errorf("read qoder stream response: %w", errRead)
 			}
 			detail := string(body)
+			if core.IsModelProbe(ctx) {
+				return NewUpstreamError(resp.StatusCode, detail)
+			}
 			if signal, queued := ParseQueueSignal(detail); queued && queueWaits < maxQueueWaits && ctx.Err() == nil {
 				wait := queueWaitFor(signal)
 				queueWaits++
@@ -1877,7 +1880,7 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 		} else {
 			lastErr = streamErr
 		}
-		if emitted || attempt >= TransientMaxRetries+maxQueueWaits || !isRetryableStreamError(lastErr) {
+		if core.IsModelProbe(ctx) || emitted || attempt >= TransientMaxRetries+maxQueueWaits || !isRetryableStreamError(lastErr) {
 			return lastErr
 		}
 	}

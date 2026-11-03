@@ -17,6 +17,7 @@ import (
 
 	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/logger"
 	"freetier2api-plugin/internal/state"
 )
@@ -213,7 +214,7 @@ func (s *Service) forEachAccount(ctx context.Context, callbackID string, targets
 		logger.Debug("skip account %s: %s", core.FirstNonEmpty(failure.Entry.Name, failure.Entry.ID), failure.Message)
 	}
 	for _, account := range accounts {
-		if errRun := fn(ctx, newAccountContext(account)); errRun != nil {
+		if errRun := fn(hostbridge.WithAuthIndex(ctx, account.Entry.AuthIndex), newAccountContext(account)); errRun != nil {
 			logger.Debug("account %s task failed: %v", core.FirstNonEmpty(account.Entry.Label, account.Entry.Name), errRun)
 		}
 		if !core.SleepContext(ctx, accountGap) {
@@ -236,6 +237,7 @@ type accountContext struct {
 
 // newAccountContext 把账号池条目转成遍历上下文。
 func newAccountContext(item auth.Account) *accountContext {
+	item.Credential.SetAuthIndex(item.Entry.AuthIndex)
 	if item.FilePath != "" {
 		item.Credential.SetFilePath(item.FilePath)
 	}
@@ -329,6 +331,7 @@ func (s *Service) runScheduledFamily(ctx context.Context, kind string) {
 // TaskSpecs 过滤：未声明的族对它没有实现，静默跳过即可，不能落 ERROR——否则
 // 每到一个排程点就刷一条「unknown scheduled task kind」，把真实错误淹没（issue #58）。
 func (s *Service) runScheduledForAccount(ctx context.Context, account *accountContext, kind string) string {
+	ctx = hostbridge.WithAuthIndex(ctx, account.entry.AuthIndex)
 	runner, okRunner := core.As[core.ScheduledRunner](account.vendor)
 	if !okRunner || !core.SupportsScheduledKind(account.vendor, kind) {
 		return ""
@@ -427,6 +430,7 @@ func (s *Service) scanAllAccounts(ctx context.Context, callbackID string) []acco
 
 // scanOneAccount 扫描单个账号。
 func (s *Service) scanOneAccount(ctx context.Context, account *accountContext) accountScan {
+	ctx = hostbridge.WithAuthIndex(ctx, account.entry.AuthIndex)
 	scan := accountScan{
 		UID:   account.uid(),
 		Label: account.label(),
@@ -573,6 +577,7 @@ func (s *Service) runQueueItems(callbackID string, concurrency int, seq int64) {
 
 	auth.RunBatch(jobs, concurrency, func(job queueJob) struct{} {
 		target := job.account
+		ctx := hostbridge.WithAuthIndex(ctx, target.entry.AuthIndex)
 		if !s.tryLockAccount(target.uid()) {
 			s.markQueueItems(job.indices, "skipped", "该账号有其它任务动作在执行", 0, 0)
 			return struct{}{}
@@ -603,6 +608,7 @@ func (s *Service) runQueueItems(callbackID string, concurrency int, seq int64) {
 
 // runTaskForAccount 调用供应商的任务执行能力并记录结果。
 func (s *Service) runTaskForAccount(ctx context.Context, account *accountContext, code string) (core.TaskRunResult, error) {
+	ctx = hostbridge.WithAuthIndex(ctx, account.entry.AuthIndex)
 	runner, okRunner := core.As[core.TaskRunner](account.vendor)
 	if !okRunner {
 		return core.TaskRunResult{}, fmt.Errorf("该供应商不支持任务执行")
@@ -693,6 +699,7 @@ type autoAllResult struct {
 
 // runAutoAll 调用供应商的一键完成，并记录每条结果。
 func (s *Service) runAutoAll(ctx context.Context, account *accountContext) []autoAllResult {
+	ctx = hostbridge.WithAuthIndex(ctx, account.entry.AuthIndex)
 	runner, okRunner := core.As[core.TaskRunner](account.vendor)
 	if !okRunner {
 		return nil
@@ -773,7 +780,7 @@ func (s *Service) activityStatusForAccounts(ctx context.Context, callbackID stri
 			entry["error"] = "该供应商没有活动任务状态"
 			return entry
 		}
-		status := provider.TaskStatus(ctx, target.credential)
+		status := provider.TaskStatus(hostbridge.WithAuthIndex(ctx, target.entry.AuthIndex), target.credential)
 		entry["in_period"] = status.InPeriod
 		if status.Error != "" {
 			entry["error"] = status.Error

@@ -106,6 +106,7 @@ func (s *Service) managementRoutes(prefix string) []pluginapi.ManagementRoute {
 		{Method: "POST", Path: prefix + "/accounts/enabled", Description: "批量启用/停用账号（写凭证上的 disabled 标记，不删除文件、不动 token）。"},
 		{Method: "POST", Path: prefix + "/accounts/add", Description: "添加 API Key 类账号。"},
 		{Method: "POST", Path: prefix + "/accounts/alias", Description: "给账号设置/清除自定义展示别名（别名优先于上游昵称显示）。"},
+		{Method: "POST", Path: prefix + "/models/probe", Description: "对所选凭证和模型测速，使用宿主正式执行链路。"},
 		{Method: "GET", Path: prefix + "/models", Description: "读取当前注册的模型清单。"},
 		{Method: "POST", Path: prefix + "/models/toggle", Description: "批量禁用/启用模型。"},
 		{Method: "POST", Path: prefix + "/models/alias", Description: "给模型设置/清除对外别名（跨供应商同名可合并路由）。"},
@@ -185,6 +186,9 @@ func (s *Service) Handle(request []byte) ([]byte, error) {
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/accounts/alias"):
 		return core.OKEnvelope(s.handleAccountAliasRequest(rpc))
+
+	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/models/probe"):
+		return core.OKEnvelope(s.handleModelProbe(rpc))
 
 	case method == http.MethodGet && matchesManagementPath(rpc.Path, id.ID, "/models"):
 		return core.OKEnvelope(s.handleModelsList(rpc))

@@ -84,8 +84,15 @@ func (a *App) handleExecutorExecute(request []byte) ([]byte, error) {
 		hostbridge.WithCallbackID(context.Background(), prepared.rpc.HostCallbackID), executorRPCTimeout)
 	defer cancel()
 
+	if prepared.rpc.Headers.Get(core.ModelProbeHeader) == "1" {
+		ctx = core.WithModelProbe(ctx)
+		prepared.rpc.Headers.Del(core.ModelProbeHeader)
+	}
 	response, errExecute := prepared.vendor.Execute(ctx, prepared.credential, prepared.executeRequest())
 	if errExecute != nil {
+		if core.IsModelProbe(ctx) {
+			return nil, core.ToProbeError(errExecute)
+		}
 		return nil, core.ToPluginError(errExecute)
 	}
 	return core.OKEnvelope(response)

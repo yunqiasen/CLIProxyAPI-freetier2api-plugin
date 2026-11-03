@@ -33,6 +33,12 @@ var deadMarkers = []string{
 
 // Classify 按 HTTP 状态码、业务码与响应体分类一个上游错误。
 func Classify(status int, code int64, body string) *core.Failure {
+	result := classify(status, code, body)
+	result.RawStatus, result.RawBody = status, body
+	return result
+}
+
+func classify(status int, code int64, body string) *core.Failure {
 	if DeadCode(code) {
 		return failure(http.StatusUnauthorized, code, body, core.FailureKindSessionDead)
 	}

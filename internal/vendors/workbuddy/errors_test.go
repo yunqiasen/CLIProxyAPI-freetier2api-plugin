@@ -243,3 +243,18 @@ func TestChannelRejectedFallsBackToRawBody(t *testing.T) {
 		t.Fatalf("message %q must keep the raw body", failure.Msg)
 	}
 }
+
+func TestProbePreservesChannelRejectionRawResponse(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusInternalServerError} {
+		body := `{"code":11128,"msg":"unapproved channel","detail":"` + strings.Repeat("x", 400) + `"}`
+		classified := Classify(status, body)
+		production := core.ToPluginError(classified).(*core.PluginError)
+		if production.HTTPStatus != http.StatusBadRequest || production.Retryable {
+			t.Fatalf("production classification changed: %+v", production)
+		}
+		probe := core.ToProbeError(classified).(*core.PluginError)
+		if probe.HTTPStatus != status || probe.Message != body {
+			t.Fatalf("probe lost raw response: %+v", probe)
+		}
+	}
+}

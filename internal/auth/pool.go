@@ -92,11 +92,12 @@ func (p *Pool) Load(ctx context.Context, callbackID string, opts Options) ([]Acc
 			failures = append(failures, Failure{Entry: entry, Message: "凭证读取失败"})
 			continue
 		}
-		credential, vendor, errResolve := p.Resolve(ctx, callbackID, raw, hostbridge.AccountIdentity(entry), nil)
+		credential, vendor, errResolve := p.Resolve(hostbridge.WithAuthIndex(ctx, entry.AuthIndex), callbackID, raw, hostbridge.AccountIdentity(entry), nil)
 		if errResolve != nil {
 			failures = append(failures, Failure{Entry: entry, Message: "凭证解析失败: " + errResolve.Error()})
 			continue
 		}
+		credential.SetAuthIndex(entry.AuthIndex)
 		if !core.RealmEnabled(opts.EnabledRealms, vendor.Region()) {
 			continue
 		}

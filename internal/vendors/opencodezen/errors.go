@@ -17,8 +17,10 @@ func Classify(status int, body string) *core.Failure {
 		kind = core.FailureKindClient
 	}
 	return &core.Failure{
-		Status: status,
-		Msg:    core.Truncate(body, 300),
-		Kind:   kind,
+		RawStatus: status,
+		RawBody:   body,
+		Status:    status,
+		Msg:       core.Truncate(body, 300),
+		Kind:      kind,
 	}
 }

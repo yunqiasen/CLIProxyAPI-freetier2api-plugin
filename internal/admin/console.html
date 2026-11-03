@@ -211,6 +211,19 @@ input.aliasinput:focus { outline: none; border-color: var(--accent); box-shadow:
 #models .col-context, #models .col-output { min-width: 76px; white-space: nowrap; }
 #models .col-caps { min-width: 105px; white-space: nowrap; }
 #models .col-efforts { min-width: 150px; white-space: nowrap; }
+#models th, #models td { padding-left: 7px; padding-right: 7px; }
+#models .col-probe { width: 1%; text-align: right; }
+#models .col-probe button { padding: 4px 10px; }
+#probeAccount, #probeModelSelect { width: 100%; margin-top: 6px; }
+#probeModelLabel { display: block; margin-top: 10px; }
+#accounts .account-probe { padding: 4px 10px; }
+#probeModel, #probeIdentity { overflow-wrap: anywhere; }
+#probeOutput { margin: 14px 0 0; padding: 12px; border: 1px solid var(--border);
+  border-radius: 9px; background: var(--bg); white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 280px; overflow: auto; font-size: 12.5px; }
+#probeSummary { margin-top: 14px; font-weight: 650; }
+#probeSummary.ok { color: var(--ok); }
+#probeSummary.err { color: var(--err); }
 
 /* 列展示：贴按钮行最右侧；菜单靠右展开，避免超出视口。 */
 .cols-setter { margin-left: auto; }
@@ -453,6 +466,25 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
         点击「模型 ID」列的模型名或其右侧 ✎ 即可编辑别名（留空=恢复官方 ID）。<b>不同供应商的模型设成同一别名</b>，宿主会当成一个 ID 自动调度。
       </div>
       <div id="models"></div>
+      <div class="modal" id="probeModal" role="dialog" aria-modal="true" aria-labelledby="probeTitle" hidden>
+        <div class="modal-box">
+          <h2 id="probeTitle">模型测速</h2>
+          <div id="probeModel" class="mono"></div>
+          <label for="probeModelSelect" id="probeModelLabel" hidden>模型</label>
+          <select id="probeModelSelect" hidden disabled></select>
+          <div class="hint">仅测试所选凭证；点击开始后发送一次真实请求。</div>
+          <label for="probeAccount">凭证</label>
+          <select id="probeAccount" disabled></select>
+          <div id="probeHint" class="hint"></div>
+          <div id="probeSummary" role="status" aria-live="polite"></div>
+          <div id="probeIdentity" class="hint"></div>
+          <pre id="probeOutput" hidden></pre>
+          <div class="claim-row">
+            <button class="act primary" id="btnProbeRun" type="button" disabled>开始测速</button>
+            <button class="act" id="btnProbeClose" type="button">关闭</button>
+          </div>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -737,7 +769,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   var HOST_PREFIX = "@host";
   function hostPath(path) { return HOST_PREFIX + path; }
 
-  function api(method, path, body) {
+  function api(method, path, body, signal) {
     // 闸门：身份未确认（或已判定失效）时绝不发请求。
     //
     // CPA 把「未携带管理密钥」也计为一次失败，5 次即封禁 30 分钟，且封的是
@@ -753,7 +785,8 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     return fetch(url, {
       method: method,
       headers: headers,
-      body: body ? JSON.stringify(body) : undefined
+      body: body ? JSON.stringify(body) : undefined,
+      signal: signal
     }).then(function (resp) {
       if (haltOnAuthFailure(resp.status)) return null;
       return resp.json().then(function (data) {
@@ -1040,6 +1073,8 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
         return api("POST", "/accounts/alias", { file_id: account.file_id, alias: next }).then(function (data) {
           if (!data) return false;
           account.alias = next;
+          refreshProbeAccounts();
+          refreshProbeIdentity();
           return next;
         });
       }
@@ -1129,7 +1164,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     var tr = el("tr");
     tr.hidden = true;
     var cell = el("td");
-    cell.colSpan = 8;
+    cell.colSpan = 9;
     // 说明文字可能很长（上游报错原文），不跟随表格的 nowrap。
     cell.style.whiteSpace = "normal";
     history.forEach(function (entry) {
@@ -1209,6 +1244,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     var head = el("tr");
     ["", "状态", "供应商", "账号", "签到", "剩余 / 总额", "使用率", "刷新时间"]
       .forEach(function (name) { head.appendChild(el("th", name)); });
+    head.appendChild(el("th", "测速"));
     table.appendChild(head);
 
     visible.forEach(function (account) {
@@ -1322,6 +1358,11 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       // 刷新时间列（展示凭证文件的最后更新时间）
       var rt = account.refreshed_at ? new Date(account.refreshed_at).toLocaleString() : "-";
       row.appendChild(el("td", rt, "muted"));
+      var probeButton = el("button", "测速", "act account-probe");
+      probeButton.type = "button";
+      probeButton.disabled = !!account.disabled || !account.auth_index;
+      probeButton.addEventListener("click", function () { openAccountProbe(account, probeButton); });
+      row.appendChild(cellWith(probeButton));
 
       table.appendChild(row);
       // 展开行紧随账号行：展开/收起只影响这一个账号，不重排整张表。
@@ -1347,6 +1388,8 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       if (!status) return;
       lastStatus = status;
       renderAccounts(status);
+      refreshProbeAccounts();
+      refreshProbeIdentity();
       var settings = status.settings || {};
       document.getElementById("setAutoCheckin").checked = !!settings.auto_checkin;
       document.getElementById("setCheckinAt").value = settings.auto_checkin_at || "10:00";
@@ -1755,7 +1798,8 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       if (m.supports_images) caps.push("图片");
       if (m.supports_tools) caps.push("工具");
       return el("td", caps.join(" · ") || "—", caps.length ? "" : "muted");
-    } }
+    } },
+    { key: "probe", header: "测速", cell: modelProbeCell }
   ];
 
   // 偏好存为对象映射 { [colKey]: boolean }：
@@ -1988,6 +2032,189 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
         });
       }
     });
+  }
+
+  // ---- 单模型测速：打开只选凭证，明确点击后才执行 ----
+  var probeContext = null;
+
+  function modelProbeCell(model) {
+    var cell = el("td");
+    var button = el("button", "测速", "act");
+    button.type = "button";
+    button.disabled = !!model.disabled;
+    button.title = model.disabled ? "模型已禁用" : "选择该供应商的凭证测试此模型";
+    button.addEventListener("click", function () { openModelProbe(model, button); });
+    cell.appendChild(button);
+    return cell;
+  }
+
+  function refreshProbeAccounts() {
+    if (!probeContext) return;
+    var select = document.getElementById("probeAccount");
+    var selected = select.value;
+    var accounts = ((lastStatus && lastStatus.accounts) || []).filter(function (account) {
+      return account.vendor_id === probeContext.vendorID && !account.disabled && account.auth_index;
+    });
+    select.textContent = "";
+    accounts.forEach(function (account) {
+      var option = el("option", accountDisplay(account));
+      option.value = String(account.auth_index);
+      select.appendChild(option);
+    });
+    select.value = accounts.some(function (account) { return String(account.auth_index) === selected; })
+      ? selected : (!selected && !probeContext.preferredIndex && accounts.length ? String(accounts[0].auth_index) : "");
+    select.disabled = !probeContext.ready || probeContext.busy || !accounts.length;
+    var modelSelect = document.getElementById("probeModelSelect");
+    modelSelect.disabled = !probeContext.ready || probeContext.busy || !probeContext.model;
+    document.getElementById("btnProbeRun").disabled = select.disabled || !select.value || !probeContext.model || !!probeContext.model.disabled;
+    setText("probeHint", !probeContext.ready ? "正在刷新凭证…" : (!accounts.length ? "该供应商没有已启用的凭证" :
+      (!probeContext.model ? "该供应商没有已启用的模型" : "")));
+  }
+
+  function openModelProbe(model, trigger) {
+    if (model.disabled) return;
+    openProbe(model, model.vendor_id, "", trigger);
+  }
+
+  function openAccountProbe(account, trigger) {
+    if (account.disabled || !account.auth_index) return;
+    openProbe(null, account.vendor_id, String(account.auth_index), trigger);
+  }
+
+  function openProbe(model, vendorID, preferredIndex, trigger) {
+    if (probeContext && probeContext.busy) return;
+    var context = { model: model, vendorID: vendorID, preferredIndex: preferredIndex,
+      trigger: trigger, ready: false, busy: false, models: [] };
+    probeContext = context;
+    var modal = document.getElementById("probeModal");
+    modal.hidden = false;
+    modal.style.display = "flex";
+    setText("probeModel", vendorLabel(vendorID, model && model.realm) + (model ? " · " + (model.alias || model.id) : ""));
+    setText("probeSummary", "");
+    setText("probeIdentity", "");
+    setText("probeOutput", "");
+    document.getElementById("probeOutput").hidden = true;
+    document.getElementById("probeAccount").value = preferredIndex;
+    var modelSelect = document.getElementById("probeModelSelect");
+    modelSelect.textContent = "";
+    modelSelect.hidden = !!model;
+    document.getElementById("probeModelLabel").hidden = !!model;
+    refreshProbeAccounts();
+    document.getElementById("btnProbeClose").focus();
+    Promise.all([api("GET", "/status"), model ? Promise.resolve(null) : api("GET", "/models")]).then(function (responses) {
+      if (probeContext !== context) return;
+      var status = responses[0];
+      if (!status) throw new Error("凭证状态未返回，请重新打开测速");
+      if (!model) {
+        if (!responses[1]) throw new Error("模型清单未返回，请重新打开测速");
+        context.models = (responses[1].models || []).filter(function (entry) {
+          return entry.vendor_id === vendorID && !entry.disabled;
+        });
+        context.models.forEach(function (entry, index) {
+          var option = el("option", entry.alias || entry.id);
+          option.value = String(index);
+          modelSelect.appendChild(option);
+        });
+        modelSelect.value = context.models.length ? "0" : "";
+        context.model = context.models[0] || null;
+      }
+      lastStatus = status;
+      renderAccounts(status);
+      context.ready = true;
+      // 账号入口初次选择只认传入的索引；该账号已移除/禁用时不悄悄换号。
+      if (preferredIndex) document.getElementById("probeAccount").value = preferredIndex;
+      refreshProbeAccounts();
+      (model ? document.getElementById("probeAccount") : modelSelect).focus();
+    }).catch(function (err) {
+      if (probeContext !== context) return;
+      setText("probeHint", err.message);
+    });
+  }
+
+  function probeAccountByIndex(index) {
+    return ((lastStatus && lastStatus.accounts) || []).find(function (account) {
+      return String(account.auth_index) === String(index) && account.vendor_id === probeContext.vendorID;
+    });
+  }
+
+  function refreshProbeIdentity() {
+    if (!probeContext || !probeContext.resultIndex) return;
+    var account = probeAccountByIndex(probeContext.resultIndex);
+    setText("probeIdentity", "凭证：" + (account ? accountDisplay(account) : "已移除的凭证") +
+      " · 模型：" + probeContext.resultModel);
+  }
+
+  function showProbeResult(data) {
+    var text = typeof data.text === "string" ? data.text : "";
+    var passed = data.ok === true && data.status >= 200 && data.status < 300 && !!text.trim() && !data.error;
+    var status = data.status === undefined ? "—" : data.status;
+    var elapsed = typeof data.latency_ms === "number" ? data.latency_ms + " ms" : "—";
+    var summary = document.getElementById("probeSummary");
+    summary.className = passed ? "ok" : "err";
+    summary.textContent = (passed ? "通过" : "失败") + " · HTTP " + status + " · " + elapsed +
+      (data.error_kind === "network" ? " · 网络错误" : "");
+    refreshProbeIdentity();
+    // 后端已脱敏与截断；这里只显示正文/报错，不展开整个响应对象。
+    var output = typeof data.error === "string" && data.error ? data.error : text;
+    if (!output.trim()) output = "响应正文为空";
+    setText("probeOutput", output);
+    document.getElementById("probeOutput").hidden = false;
+  }
+
+  function runModelProbe() {
+    var context = probeContext;
+    if (!context || !context.ready || context.busy || !context.model || context.model.disabled) return;
+    var index = document.getElementById("probeAccount").value;
+    var account = probeAccountByIndex(index);
+    if (!account || account.disabled) {
+      setText("probeHint", "请选择该供应商已启用的凭证");
+      return;
+    }
+    context.busy = true;
+    context.resultIndex = index;
+    context.resultModel = context.model.alias || context.model.id;
+    refreshProbeAccounts();
+    refreshProbeIdentity();
+    var button = document.getElementById("btnProbeRun");
+    button.textContent = "测速中…";
+    document.getElementById("btnProbeClose").disabled = true;
+    document.getElementById("probeModal").setAttribute("aria-busy", "true");
+    setText("probeSummary", "正在请求，最多等待 90 秒…");
+    document.getElementById("probeSummary").className = "muted";
+    setText("probeOutput", "");
+    document.getElementById("probeOutput").hidden = true;
+    var controller = new AbortController();
+    var timedOut = false;
+    var timer = setTimeout(function () { timedOut = true; controller.abort(); }, 90000);
+    api("POST", "/models/probe", {
+      auth_index: index,
+      vendor_id: context.model.vendor_id,
+      model: context.model.alias || context.model.id
+    }, controller.signal).then(function (data) {
+      if (probeContext !== context) return;
+      showProbeResult(data || { ok: false, error: "请求未执行，请检查管理密钥" });
+    }).catch(function (err) {
+      if (probeContext !== context) return;
+      showProbeResult({ ok: false, status: err.status, error: timedOut ? "测速超过 90 秒，已取消请求" : err.message });
+    }).then(function () {
+      clearTimeout(timer);
+      if (probeContext !== context) return;
+      context.busy = false;
+      button.textContent = "开始测速";
+      document.getElementById("btnProbeClose").disabled = false;
+      document.getElementById("probeModal").removeAttribute("aria-busy");
+      refreshProbeAccounts();
+    });
+  }
+
+  function closeModelProbe() {
+    if (!probeContext || probeContext.busy) return;
+    var trigger = probeContext.trigger;
+    probeContext = null;
+    var modal = document.getElementById("probeModal");
+    modal.hidden = true;
+    modal.style.display = "none";
+    if (trigger) trigger.focus();
   }
 
   // selectedModelIDs 取当前勾选的模型（用于批量操作）。
@@ -2963,6 +3190,22 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   document.getElementById("btnSelectNoneAccounts").addEventListener("click", function () { setAllAccountsSelected(false); });
   document.getElementById("btnDeleteAccounts").addEventListener("click", function () { deleteSelectedAccounts(this); });
   document.getElementById("btnLoadModels").addEventListener("click", function () { refreshModels(false); });
+  document.getElementById("btnProbeRun").addEventListener("click", runModelProbe);
+  document.getElementById("probeAccount").addEventListener("change", function () {
+    if (probeContext && !probeContext.busy) refreshProbeAccounts();
+  });
+  document.getElementById("probeModelSelect").addEventListener("change", function () {
+    if (!probeContext || probeContext.busy) return;
+    probeContext.model = probeContext.models[Number(this.value)] || null;
+    refreshProbeAccounts();
+  });
+  document.getElementById("btnProbeClose").addEventListener("click", closeModelProbe);
+  document.getElementById("probeModal").addEventListener("click", function (event) {
+    if (event.target === this) closeModelProbe();
+  });
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape") closeModelProbe();
+  });
 
   // ---- 模型表列展示 ----
   //

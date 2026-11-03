@@ -67,9 +67,11 @@ func Classify(status int, body string) *core.Failure {
 	lower := strings.ToLower(body)
 	kind := classifyKind(status, lower, body)
 	return &core.Failure{
-		Status: status,
-		Msg:    core.Truncate(errorMessage(body), 300),
-		Kind:   kind,
+		RawStatus: status,
+		RawBody:   body,
+		Status:    status,
+		Msg:       core.Truncate(errorMessage(body), 300),
+		Kind:      kind,
 	}
 }
 

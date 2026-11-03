@@ -24,6 +24,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/logger"
 )
 
@@ -164,10 +165,11 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 
 // fetchModels 借探测凭证拉取上游模型清单。
 func (v *adapter) fetchModels(ctx context.Context) ([]Model, error) {
-	cred, okCred := core.ProbeNativeCredential(v.Env, v.ID(), func(c *core.Credential) (*Credential, bool) {
+	cred, authIndex, okCred := core.ProbeNativeCredentialWithIndex(ctx, v.Env, v.ID(), func(c *core.Credential) (*Credential, bool) {
 		native, okNative := c.Native.(*Credential)
 		return native, okNative
 	})
+	ctx = hostbridge.WithAuthIndex(ctx, authIndex)
 	if !okCred || cred == nil {
 		return nil, fmt.Errorf("no credential available for model probe")
 	}

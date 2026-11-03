@@ -79,10 +79,11 @@ func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
 // 可用凭证去打；借不到就返回空清单——不编一份假清单，否则用户会看到
 // 调用必失败的模型。
 func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, error) {
-	apiKey := v.probeAPIKey()
+	apiKey, authIndex := v.probeAPIKey(ctx)
 	if apiKey == "" {
 		return nil, fmt.Errorf("no opencodezen credential available for model probe")
 	}
+	ctx = hostbridge.WithAuthIndex(ctx, authIndex)
 	models, errModels := FetchModels(ctx, v.baseURL, apiKey)
 	if errModels != nil {
 		return nil, errModels
@@ -232,15 +233,15 @@ func (v *adapter) catalog(ctx context.Context) modelsDevCatalog {
 }
 
 // probeAPIKey 借一个本供应商的可用凭证取 API key（供模型探测用）。
-func (v *adapter) probeAPIKey() string {
-	native, okNative := core.ProbeNativeCredential(v.Env, VendorID, func(cred *core.Credential) (*Credential, bool) {
+func (v *adapter) probeAPIKey(ctx context.Context) (string, string) {
+	native, authIndex, okNative := core.ProbeNativeCredentialWithIndex(ctx, v.Env, VendorID, func(cred *core.Credential) (*Credential, bool) {
 		value, okValue := cred.Native.(*Credential)
 		return value, okValue
 	})
 	if !okNative || native == nil {
-		return ""
+		return "", ""
 	}
-	return native.APIKey
+	return native.APIKey, authIndex
 }
 
 // ConfigFields 声明 opencodezen 专属配置。

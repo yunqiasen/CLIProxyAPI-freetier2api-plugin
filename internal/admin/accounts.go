@@ -639,6 +639,7 @@ func (s *Service) runForAccounts(
 		})
 	}
 	jobResults := auth.RunBatch(loaded, batchConcurrency, func(current auth.Account) accountActionResult {
+		ctx := hostbridge.WithAuthIndex(ctx, current.Entry.AuthIndex)
 		result := accountActionResult{
 			AuthID:   core.FirstNonEmpty(current.Entry.ID, current.Entry.Name),
 			Label:    core.FirstNonEmpty(current.Credential.LabelValue(), current.Entry.Label),

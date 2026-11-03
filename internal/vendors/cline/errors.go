@@ -15,8 +15,10 @@ import (
 // Classify 按 HTTP 状态码分类一个上游错误。
 func Classify(status int, body string) *core.Failure {
 	return &core.Failure{
-		Status: status,
-		Msg:    core.Truncate(body, 300),
-		Kind:   core.ClassifyStatus(status),
+		RawStatus: status,
+		RawBody:   body,
+		Status:    status,
+		Msg:       core.Truncate(body, 300),
+		Kind:      core.ClassifyStatus(status),
 	}
 }

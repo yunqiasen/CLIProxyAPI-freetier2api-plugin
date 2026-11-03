@@ -47,6 +47,10 @@ func ToPluginError(err error) error {
 	if err == nil {
 		return nil
 	}
+	var existing *PluginError
+	if errors.As(err, &existing) {
+		return &PluginError{Code: existing.Code, Message: err.Error(), Retryable: existing.Retryable, HTTPStatus: existing.HTTPStatus, RequestStop: existing.RequestStop, cause: existing.cause}
+	}
 	var upstreamErr UpstreamError
 	if errors.As(err, &upstreamErr) {
 		status := upstreamErr.HTTPStatus()
@@ -54,12 +58,41 @@ func ToPluginError(err error) error {
 			status = http.StatusBadGateway
 		}
 		code := upstreamCode(upstreamErr.UpstreamKind())
-		if upstreamErr.Retryable() {
-			return RetryablePluginError(code, err.Error(), status)
-		}
-		return NewPluginError(code, err.Error(), status)
+		result := &PluginError{Code: code, Message: err.Error(), HTTPStatus: status, Retryable: upstreamErr.Retryable(), cause: err}
+		return result
 	}
 	return RetryablePluginError("upstream_request_failed", err.Error(), http.StatusBadGateway)
+}
+
+// ToProbeError keeps the upstream body and HTTP status for explicit diagnostics.
+// Production credential scheduling continues to use ToPluginError.
+func ToProbeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	message := err.Error()
+	var detail UpstreamDetail
+	if errors.As(err, &detail) {
+		message = detail.UpstreamMessage()
+	}
+	status := http.StatusBadGateway
+	var existing *PluginError
+	if errors.As(err, &existing) {
+		status = existing.HTTPStatus
+	}
+	var coded interface{ StatusCode() int }
+	if errors.As(err, &coded) && coded.StatusCode() > 0 {
+		status = coded.StatusCode()
+	}
+	var classified UpstreamError
+	if errors.As(err, &classified) {
+		status = classified.HTTPStatus()
+	}
+	var raw interface{ RawHTTPStatus() int }
+	if errors.As(err, &raw) && raw.RawHTTPStatus() > 0 {
+		status = raw.RawHTTPStatus()
+	}
+	return &PluginError{Code: "upstream_probe", Message: message, HTTPStatus: status, RequestStop: true}
 }
 
 // upstreamCode 生成错误码：upstream_<kind>。
@@ -80,10 +113,11 @@ type envelope struct {
 
 // envelopeError 携带可选 HTTP 状态码；宿主据此决定冷却或轮转当前凭证。
 type envelopeError struct {
-	Code       string `json:"code"`
-	Message    string `json:"message"`
-	Retryable  bool   `json:"retryable,omitempty"`
-	HTTPStatus int    `json:"http_status,omitempty"`
+	Code        string `json:"code"`
+	Message     string `json:"message"`
+	Retryable   bool   `json:"retryable,omitempty"`
+	HTTPStatus  int    `json:"http_status,omitempty"`
+	RequestStop bool   `json:"request_stop,omitempty"`
 }
 
 // PluginError 是插件内部的结构化错误：可携带 HTTP 状态码与可重试标记。
@@ -95,6 +129,10 @@ type PluginError struct {
 	Message    string
 	Retryable  bool
 	HTTPStatus int
+	// RequestStop prevents request replay without affecting credential availability.
+	RequestStop bool
+	// cause retains diagnostic evidence through in-process adapter conversion.
+	cause error
 }
 
 // Error 实现 error 接口。
@@ -103,6 +141,14 @@ func (e *PluginError) Error() string {
 		return ""
 	}
 	return e.Message
+}
+
+// Unwrap retains the upstream response for diagnostic error conversion.
+func (e *PluginError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
 }
 
 // NewPluginError 构造一个带 HTTP 状态码的插件错误。
@@ -140,10 +186,11 @@ func ErrorEnvelopeFromError(err error) []byte {
 	}
 	if pluginErr, ok := err.(*PluginError); ok {
 		raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{
-			Code:       pluginErr.Code,
-			Message:    pluginErr.Message,
-			Retryable:  pluginErr.Retryable,
-			HTTPStatus: pluginErr.HTTPStatus,
+			Code:        pluginErr.Code,
+			Message:     pluginErr.Message,
+			Retryable:   pluginErr.Retryable,
+			HTTPStatus:  pluginErr.HTTPStatus,
+			RequestStop: pluginErr.RequestStop,
 		}})
 		return raw
 	}
@@ -204,6 +251,10 @@ type Failure struct {
 	Msg        string
 	RetryAfter time.Duration
 	ResetAt    time.Time
+
+	// RawStatus and RawBody retain evidence before scheduling classification.
+	RawStatus int
+	RawBody   string
 
 	// RetryableOverride 允许供应商覆盖通用的可重试判定（nil 表示按 FailureKind 推导）。
 	RetryableOverride *bool
@@ -276,7 +327,18 @@ func (e *Failure) UpstreamMessage() string {
 	if e == nil {
 		return ""
 	}
+	if e.RawStatus > 0 || e.RawBody != "" {
+		return e.RawBody
+	}
 	return e.Msg
+}
+
+// RawHTTPStatus returns the original response status, not its scheduling status.
+func (e *Failure) RawHTTPStatus() int {
+	if e == nil {
+		return 0
+	}
+	return e.RawStatus
 }
 
 // Bool 返回 bool 指针（构造 RetryableOverride 用）。

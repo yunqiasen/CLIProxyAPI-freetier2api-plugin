@@ -2,13 +2,11 @@ package autoclaw
 
 // 本文件实现 AutoClaw 的模型清单与账号信息获取。
 //
-// 清单来源（与 Agent2API 一致）：
-//   - global：GET {base}/autoclaw-proxy/proxy/autoclaw-model-config（实时目录，
-//     含 contextWindow / maxTokens / reasoning 等元数据）；
-//   - cn：静态表（沙箱 relay 通道的模型，上游无对应实时目录接口可从
-//     userapi 直接拉取；实时性以模型可用性实测为准）。
+// 国内版与国际版都从各自基地址的 autoclaw-model-config 获取实时目录。
+// 国内版接口与顶层 models 结构已由 2026-11-02 的 lab 记录确认，
+// 不再使用国内沙箱 relay 的历史静态模型 ID。
 //
-// 探测需要一把有效凭证；探测失败返回空清单而不是编造清单。
+// 本层返回上游结果与错误；适配器负责保留上一次成功的目录。
 
 import (
 	"context"
@@ -81,28 +79,18 @@ func (p modelConfigPayload) entries() []modelConfigEntry {
 	return p.Data.Models
 }
 
-// cnStaticModels 是国内版沙箱 relay 通道的模型表（Agent2API 2026-09 快照）。
-var cnStaticModels = []string{
-	"openclaw", "openclaw/default", "glm-5.3-flash", "glm-2", "zai_auto",
-	"zai_auto-fast", "zai_glm-5.3-flash", "zaicoding_glm-5.3",
-	"tdpsk_deepseek-v4-flash-202605", "tdpsk_deepseek-v4-pro-202606",
-}
-
 // FetchModels 拉取区域模型清单。
-func FetchModels(ctx context.Context, baseURL string, token string, region Region) ([]Model, error) {
+func FetchModels(ctx context.Context, baseURL string, token string, _ Region) ([]Model, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, fmt.Errorf("access token is required to list models")
 	}
 	if strings.TrimSpace(baseURL) == "" {
 		return nil, fmt.Errorf("upstream base URL is not configured")
 	}
-	if region.IsGlobal() {
-		return fetchModelConfig(ctx, baseURL, token)
-	}
-	return staticCNModels(), nil
+	return fetchModelConfig(ctx, baseURL, token)
 }
 
-// fetchModelConfig 拉取国际版实时模型配置。
+// fetchModelConfig 拉取当前区域的实时模型配置。
 func fetchModelConfig(ctx context.Context, baseURL, token string) ([]Model, error) {
 	endpoint := baseURL + ModelsConfigPath
 	req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
@@ -164,6 +152,9 @@ func fetchModelConfig(ctx context.Context, baseURL, token string) ([]Model, erro
 			Credits:         levelText(entry.CreditConsumptionLevel),
 		})
 	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("model config returned 0 valid model(s)")
+	}
 	return out, nil
 }
 
@@ -195,22 +186,6 @@ func modelAcceptsImages(input []string) bool {
 		}
 	}
 	return false
-}
-
-// staticCNModels 返回国内版静态模型表。
-func staticCNModels() []Model {
-	out := make([]Model, 0, len(cnStaticModels))
-	for _, id := range cnStaticModels {
-		out = append(out, Model{
-			ID:              id,
-			Name:            id,
-			Description:     "AutoClaw 国内版沙箱模型",
-			ContextWindow:   core.DefaultContextWindow(id),
-			MaxOutputTokens: core.DefaultMaxOutputTokens,
-			SupportsTools:   true,
-		})
-	}
-	return out
 }
 
 // RefreshTokenResult 是一次 token 刷新的结果。

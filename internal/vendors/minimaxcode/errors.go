@@ -49,6 +49,7 @@ var (
 // 此时分类完全由正文决定，且必须把 Status 归零——否则 Failure.HTTPStatus
 // 会原样透传 200，宿主会把一次明确的余额耗尽当成成功。
 func Classify(status int, body string) *core.Failure {
+	rawStatus := status
 	lower := strings.ToLower(body)
 	kind := core.FailureKindTransient
 	if status >= http.StatusBadRequest {
@@ -69,10 +70,12 @@ func Classify(status int, body string) *core.Failure {
 		status = 0
 	}
 	return &core.Failure{
-		Kind:   kind,
-		Status: status,
-		Code:   upstreamCode(body),
-		Msg:    core.Truncate(body, 300),
+		RawStatus: rawStatus,
+		RawBody:   body,
+		Kind:      kind,
+		Status:    status,
+		Code:      upstreamCode(body),
+		Msg:       core.Truncate(body, 300),
 	}
 }
 

@@ -115,7 +115,7 @@ func Classify(status int, body string) *core.Failure {
 	// 并把多语言正文折叠成一条可读消息（原文由调用方写进日志留证）。
 	if codeMarker(lower, channelRejectedCode) || core.ContainsAny(lower, channelRejectedMarkers) {
 		return &core.Failure{Kind: core.FailureKindChannelRejected, Status: http.StatusBadRequest,
-			Code: channelRejectedCode, Msg: channelRejectedMessage(body)}
+			Code: channelRejectedCode, Msg: channelRejectedMessage(body), RawStatus: status, RawBody: body}
 	}
 	// 1) 余额耗尽（明确的 402）。
 	if status == http.StatusPaymentRequired {

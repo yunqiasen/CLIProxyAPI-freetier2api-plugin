@@ -16,6 +16,7 @@ import (
 
 	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/logger"
 )
 
@@ -39,6 +40,7 @@ type KeepaliveResult struct {
 // 额度查询遇 401 的重试可能同时命中同一个账号，而它们手里是续期前加载的
 // 同一份旧凭证。
 func (s *Service) RefreshAccount(ctx context.Context, callbackID string, account *accountContext) (refreshed bool, err error) {
+	ctx = hostbridge.WithAuthIndex(ctx, account.entry.AuthIndex)
 	authID := core.FirstNonEmpty(account.entry.ID, account.entry.Name, account.uid())
 	before := account.credential.TokenValue()
 	reuse, unlock := s.refreshGate.begin(authID, before)

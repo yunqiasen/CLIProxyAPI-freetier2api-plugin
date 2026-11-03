@@ -12,6 +12,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 type adapter struct {
@@ -140,10 +141,11 @@ func (v *adapter) Configure(_ core.Settings, raw map[string]string) {
 
 func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, error) {
 	// 借一个可用凭证探测上游目录（Catalog.StaticModels 只在有凭证时调用本方法）。
-	cred, okCred := core.ProbeNativeCredential(v.Env, v.ID(), func(c *core.Credential) (*Credential, bool) {
+	cred, authIndex, okCred := core.ProbeNativeCredentialWithIndex(ctx, v.Env, v.ID(), func(c *core.Credential) (*Credential, bool) {
 		native, okNative := c.Native.(*Credential)
 		return native, okNative
 	})
+	ctx = hostbridge.WithAuthIndex(ctx, authIndex)
 	if !okCred || cred == nil {
 		return nil, fmt.Errorf("trae: 无可用凭证，无法拉取模型目录")
 	}

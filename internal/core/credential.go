@@ -17,6 +17,9 @@ import (
 type Credential struct {
 	mu sync.Mutex
 
+	// AuthIndex is the host runtime credential selector, never a provider token.
+	AuthIndex string
+
 	// VendorID 是供应商实例标识（workbuddycn 等），决定请求走哪个上游。
 	VendorID string
 	// Region 是区域标识（cn / global）。
@@ -368,4 +371,23 @@ func (a *NativeAdapter[T]) MergeStorageJSON(original []byte, cred *Credential) (
 		return original, errNative
 	}
 	return a.spec.MergeNative(original, native)
+}
+
+// AuthIndexValue returns the host credential index associated with this snapshot.
+func (c *Credential) AuthIndexValue() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.AuthIndex
+}
+
+func (c *Credential) SetAuthIndex(index string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.AuthIndex = strings.TrimSpace(index)
 }

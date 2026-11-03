@@ -12,6 +12,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 // adapter 是 core.Vendor 在 CodeArts 上的实现。
@@ -128,10 +129,11 @@ func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
 // 「刷新模型目录后少 5 个模型」（issue #58）。没有可用凭证时退回内置目录——
 // model.static 可能先于凭证加载被调用，报错会让宿主把整家供应商当成探测失败。
 func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, error) {
-	probe, _ := core.ProbeNativeCredential(v.Env, v.ID(), func(c *core.Credential) (*Credential, bool) {
+	probe, authIndex, _ := core.ProbeNativeCredentialWithIndex(ctx, v.Env, v.ID(), func(c *core.Credential) (*Credential, bool) {
 		native, okNative := c.Native.(*Credential)
 		return native, okNative
 	})
+	ctx = hostbridge.WithAuthIndex(ctx, authIndex)
 	models, errModels := v.fetchModels(ctx, probe)
 	if errModels != nil {
 		return nil, errModels

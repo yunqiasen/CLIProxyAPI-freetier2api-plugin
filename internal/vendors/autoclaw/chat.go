@@ -219,7 +219,9 @@ func Chat(ctx context.Context, baseURL string, req ChatRequest) ([]byte, error) 
 	}
 	// 业务信封形态（{"code","msg","data"}）：非 0 业务码按错误处理。
 	if code, msg, ok := envelopeError(body); ok {
-		return nil, Classify(resp.StatusCode, code, msg)
+		failure := Classify(resp.StatusCode, code, msg)
+		failure.RawBody = string(body)
+		return nil, failure
 	}
 	return body, nil
 }

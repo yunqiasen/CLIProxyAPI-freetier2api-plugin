@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/state"
 )
 
@@ -80,6 +81,7 @@ func (s *Service) Checkin(ctx context.Context, vendor core.Vendor, credential *c
 		}
 	}
 
+	ctx = hostbridge.WithAuthIndex(ctx, credential.AuthIndexValue())
 	result, errCheckin := provider.Checkin(ctx, credential)
 	if errCheckin != nil {
 		s.recordCheckinFailure(vendor, credential, trigger, errCheckin.Error())

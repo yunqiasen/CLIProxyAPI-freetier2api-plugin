@@ -8,7 +8,7 @@ package autoclaw
 // 能力面（对齐 Agent2API 实测协议）：
 //   - 凭证解析与偏严归属（accessToken/refreshToken 结构）；
 //   - chat 走 region proxy 通道（X-Request-Model 声明模型）；
-//   - 模型清单：global 实时拉 autoclaw-model-config，cn 用静态表；
+//   - 模型清单：各区域实时拉 autoclaw-model-config；
 //   - token 自动续期（POST /userapi/v1/refresh）；
 //   - 积分额度查询（GET /agent-assetmgr/api/v2/wallets）；
 //   - 每日签到（POST .../autoclaw-task-complete，幂等）。
@@ -18,8 +18,11 @@ package autoclaw
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
@@ -43,6 +46,16 @@ type adapter struct {
 
 	// credits 缓存最近一轮目录探测的倍率表（官方模型 ID → 展示文案）。
 	credits core.CreditTable
+
+	// catalogs 仅保存实时探测成功的结果，按上游与凭证隔离。
+	// token 只保留摘要，首次失败的凭证不会借用别的凭证的目录。
+	catalogMu sync.RWMutex
+	catalogs  map[modelCatalogKey][]Model
+}
+
+type modelCatalogKey struct {
+	baseURL   string
+	tokenHash [sha256.Size]byte
 }
 
 // Instances 构造 AutoClaw 的两个区域实例。
@@ -150,11 +163,12 @@ func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
 //
 // 探测需要一把有效凭证；借不到就返回错误（不编清单）。
 func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, error) {
-	token := v.probeToken()
+	token, authIndex := v.probeToken(ctx)
 	if token == "" {
 		return nil, fmt.Errorf("no autoclaw credential available for model probe")
 	}
-	models, errModels := FetchModels(ctx, v.resolveBaseURL(), token, v.region)
+	ctx = hostbridge.WithAuthIndex(ctx, authIndex)
+	models, errModels := v.fetchModels(ctx, token)
 	if errModels != nil {
 		return nil, errModels
 	}
@@ -163,21 +177,49 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 
 // ModelsForAuth 返回该凭证可用的模型。
 //
-// 用**该凭证自己的 token** 去探测：token 失效时该账号自然拿不到模型，
-// 宿主据此把它从选号里淘汰。
+// 用该凭证自己的 token 探测；临时失败时保留该凭证最近成功的目录。
+// 目录只说明供应商有哪些模型，实际可用性由真实请求判断。
 func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]pluginapi.ModelInfo, error) {
 	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
 	}
-	models, errModels := FetchModels(ctx, v.resolveBaseURL(), native.AccessTokenValue(), v.region)
+	models, errModels := v.fetchModels(ctx, native.AccessTokenValue())
 	if errModels != nil {
-		// 探测失败返回空清单而不是报错：宿主会因为空清单跳过该凭证。
-		// 必须用 Info：宿主日志默认 info 级别，Debug 会被完全吞掉。
-		logger.Info("autoclaw: model probe failed: %v", errModels)
-		return nil, nil
+		return nil, errModels
 	}
 	return v.modelsToPluginAPI(models), nil
+}
+
+// fetchModels 每次都取实时目录，只在失败时使用本实例的最后成功结果。
+func (v *adapter) fetchModels(ctx context.Context, token string) ([]Model, error) {
+	baseURL := v.resolveBaseURL()
+	key := modelCatalogKey{baseURL: baseURL, tokenHash: sha256.Sum256([]byte(token))}
+	models, errModels := FetchModels(ctx, baseURL, token, v.region)
+	if errModels == nil {
+		v.catalogMu.Lock()
+		if v.catalogs == nil {
+			v.catalogs = make(map[modelCatalogKey][]Model)
+		}
+		v.catalogs[key] = append([]Model(nil), models...)
+		v.catalogMu.Unlock()
+		return models, nil
+	}
+	// 凭证失效是明确结论，不用旧目录把它重新注册为可用凭证。
+	// 控制台的共享目录仍由 Catalog 保留最后成功结果。
+	var failure *core.Failure
+	if errors.As(errModels, &failure) && (failure.Kind == core.FailureKindCredential || failure.Kind == core.FailureKindSessionDead) {
+		logger.Info("autoclaw: %s model probe failed: %v", v.ID(), errModels)
+		return nil, errModels
+	}
+	v.catalogMu.RLock()
+	cached := append([]Model(nil), v.catalogs[key]...)
+	v.catalogMu.RUnlock()
+	logger.Info("autoclaw: %s model probe failed: %v; keeping %d cached model(s)", v.ID(), errModels, len(cached))
+	if len(cached) > 0 {
+		return cached, nil
+	}
+	return nil, errModels
 }
 
 // modelsToPluginAPI 把上游模型条目转成宿主契约类型，顺带记下倍率表。
@@ -321,15 +363,15 @@ func (v *adapter) resolveBaseURL() string {
 }
 
 // probeToken 借一个本实例的可用凭证取 access token（供模型探测用）。
-func (v *adapter) probeToken() string {
-	native, okNative := core.ProbeNativeCredential(v.Env, v.ID(), func(cred *core.Credential) (*Credential, bool) {
+func (v *adapter) probeToken(ctx context.Context) (string, string) {
+	native, authIndex, okNative := core.ProbeNativeCredentialWithIndex(ctx, v.Env, v.ID(), func(cred *core.Credential) (*Credential, bool) {
 		value, okValue := cred.Native.(*Credential)
 		return value, okValue
 	})
 	if !okNative || native == nil {
-		return ""
+		return "", ""
 	}
-	return native.AccessTokenValue()
+	return native.AccessTokenValue(), authIndex
 }
 
 // 编译期断言：适配器实际具备的供应商能力。

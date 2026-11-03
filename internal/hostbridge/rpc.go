@@ -215,22 +215,29 @@ func MarshalPayload(callbackID string, payload any) ([]byte, error) {
 	return json.Marshal(fields)
 }
 
+// CallError keeps the host status and original message separate from RPC diagnostics.
+type CallError struct {
+	Code       string `json:"code"`
+	Message    string `json:"message"`
+	HTTPStatus int    `json:"http_status"`
+}
+
+func (e *CallError) Error() string   { return e.Code + ": " + e.Message }
+func (e *CallError) StatusCode() int { return e.HTTPStatus }
+
 // DecodeEnvelope 解开宿主回调返回的信封，取出 result 部分。
 func DecodeEnvelope(raw []byte) (json.RawMessage, error) {
 	var env struct {
 		OK     bool            `json:"ok"`
 		Result json.RawMessage `json:"result,omitempty"`
-		Error  *struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error,omitempty"`
+		Error  *CallError      `json:"error,omitempty"`
 	}
 	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode envelope: %w", errUnmarshal)
 	}
 	if !env.OK {
 		if env.Error != nil {
-			return nil, fmt.Errorf("%s: %s", env.Error.Code, env.Error.Message)
+			return nil, env.Error
 		}
 		return nil, fmt.Errorf("host callback failed")
 	}

@@ -3,12 +3,14 @@ package minimaxcode
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
 	"testing"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
 )
 
@@ -236,7 +238,7 @@ func TestSigninTargetSignsExactWireQuery(t *testing.T) {
 // TestCheckinFailsOnBusinessErrorEnvelope 锁住 HTTP 200 + base_resp 非零必须失败。
 func TestCheckinFailsOnBusinessErrorEnvelope(t *testing.T) {
 	base := stubCheckinHost(t,
-		`{"base_resp":{"status_code":0},"data":{"days":[]}}`,
+		`{"base_resp":{"status_code":0},"data":{"days":[{"is_today":true,"status":2}]}}`,
 		`{"base_resp":{"status_code":1001,"status_msg":"invalid timezone_id"},"data":{}}`)
 	_, errCheckin := Checkin(context.Background(), checkinCredential(), base)
 	if errCheckin == nil {
@@ -250,7 +252,7 @@ func TestCheckinFailsOnBusinessErrorEnvelope(t *testing.T) {
 // TestCheckinRejectsUnknownClaimResult 锁住 claim_result 只接受 1/2。
 func TestCheckinRejectsUnknownClaimResult(t *testing.T) {
 	base := stubCheckinHost(t,
-		`{"base_resp":{"status_code":0},"data":{"days":[]}}`,
+		`{"base_resp":{"status_code":0},"data":{"days":[{"is_today":true,"status":2}]}}`,
 		`{"base_resp":{"status_code":0},"data":{"claim_result":0,"points":800}}`)
 	_, errCheckin := Checkin(context.Background(), checkinCredential(), base)
 	if errCheckin == nil {
@@ -261,7 +263,7 @@ func TestCheckinRejectsUnknownClaimResult(t *testing.T) {
 // TestCheckinClaimsPoints 锁住 claim_result=1 时上报 points（不是 points+bonus）。
 func TestCheckinClaimsPoints(t *testing.T) {
 	base := stubCheckinHost(t,
-		`{"base_resp":{"status_code":0},"data":{"days":[]}}`,
+		`{"base_resp":{"status_code":0},"data":{"days":[{"is_today":true,"status":2}]}}`,
 		`{"base_resp":{"status_code":0},"data":{"claim_result":1,"points":800,"bonus_points":400}}`)
 	result, errCheckin := Checkin(context.Background(), checkinCredential(), base)
 	if errCheckin != nil {
@@ -285,5 +287,177 @@ func TestSigninBusinessError(t *testing.T) {
 	}})
 	if err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("非零业务码应带原因: %v", err)
+	}
+}
+
+func TestCheckinRequiresAccessToken(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cred *Credential
+	}{
+		{"missing credential", nil},
+		{"cn missing token", &Credential{Region: RegionCN}},
+		{"cn blank token", &Credential{Region: RegionCN, AccessToken: " \t "}},
+		{"global missing token", &Credential{Region: RegionGlobal}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := stubCheckinHost(t,
+				`{"base_resp":{"status_code":0},"data":{"days":[]}}`,
+				`{"base_resp":{"status_code":0},"data":{"claim_result":1,"points":400}}`)
+			result, err := Checkin(context.Background(), tc.cred, base)
+			var problem *core.PluginError
+			if result != nil || !errors.As(err, &problem) || problem.HTTPStatus != http.StatusUnauthorized {
+				t.Fatalf("result=%+v, error=%v; want credential error", result, err)
+			}
+			if tc.cred != nil && !strings.Contains(problem.Message, "access_token") {
+				t.Fatalf("error=%v; want missing access_token reason", problem)
+			}
+		})
+	}
+}
+
+func TestCheckinAlreadyClaimedIsIdempotent(t *testing.T) {
+	for _, region := range []Region{RegionCN, RegionGlobal} {
+		for _, tc := range []struct {
+			name       string
+			statusBody string
+			claimBody  string
+		}{
+			{"status confirms claimed", `{"base_resp":{"status_code":0},"data":{"days":[{"is_today":true,"status":3,"points":400}]}}`, `{"base_resp":{"status_code":9,"status_msg":"claim must not be attempted"}}`},
+			{"claim confirms duplicate", `{"base_resp":{"status_code":0},"data":{"days":[{"is_today":true,"status":2}]}}`, `{"base_resp":{"status_code":0},"data":{"claim_result":2,"points":400}}`},
+		} {
+			t.Run(string(region)+"/"+tc.name, func(t *testing.T) {
+				base := stubCheckinHost(t, tc.statusBody, tc.claimBody)
+				result, err := Checkin(context.Background(), &Credential{Region: region, AccessToken: "fixture-token"}, base)
+				if err != nil || result == nil || !result.Already || result.NotRecorded || result.Credit != 0 {
+					t.Fatalf("result=%+v, error=%v; want idempotent success with no new points", result, err)
+				}
+			})
+		}
+	}
+}
+
+func TestCheckinStopsOnInvalidStatusCredential(t *testing.T) {
+	stubRegionalCheckin(t, "agent.minimaxi.com", http.StatusUnauthorized, `{"error":"invalid access token"}`,
+		http.StatusOK, `{"base_resp":{"status_code":0},"data":{"claim_result":1,"points":400}}`)
+	result, err := Checkin(context.Background(), &Credential{Region: RegionCN, AccessToken: "expired-token"}, "")
+	var upstream core.UpstreamError
+	if result != nil || !errors.As(err, &upstream) || upstream.HTTPStatus() != http.StatusUnauthorized || !strings.Contains(err.Error(), "invalid access token") {
+		t.Fatalf("result=%+v, error=%v; want upstream credential failure", result, err)
+	}
+}
+
+// The lab status decoder maps status=1 to a future day. The status message is
+// the only available opening-time evidence; the adapter must not invent a time.
+func TestCheckinWindowNotOpenIsNotRecorded(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		statusBody string
+		want       string
+	}{
+		{"upstream supplies opening time", `{"base_resp":{"status_code":0,"status_msg":"签到窗口将于 2026-11-04T00:00:00+08:00 开启"},"data":{"days":[{"is_today":true,"status":1}]}}`, "2026-11-04T00:00:00+08:00"},
+		{"upstream supplies no opening time", `{"base_resp":{"status_code":0,"status_msg":"ok"},"data":{"days":[{"is_today":true,"status":1}]}}`, "上游未提供开启时间"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := stubCheckinHost(t, tc.statusBody,
+				`{"base_resp":{"status_code":0},"data":{"claim_result":1,"points":400}}`)
+			result, err := Checkin(context.Background(), &Credential{Region: RegionCN, AccessToken: "fixture-token"}, base)
+			if err != nil || result == nil || !result.NotRecorded || result.Already || result.Credit != 0 || !strings.Contains(result.Message, tc.want) {
+				t.Fatalf("result=%+v, error=%v; want unrecorded window with %q", result, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestCheckinReportsCredentialAndBusinessFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		statusCode int
+		statusBody string
+		claimCode  int
+		claimBody  string
+		wantStatus int
+		wantReason string
+	}{
+		{"status token envelope", http.StatusOK, `{"base_resp":{"status_code":401,"status_msg":"invalid access token"}}`, http.StatusOK, `{"data":{"claim_result":1,"points":400}}`, http.StatusUnauthorized, "invalid access token"},
+		{"claim token expired", http.StatusOK, `{"base_resp":{"status_code":0},"data":{"days":[{"is_today":true,"status":2}]}}`, http.StatusUnauthorized, `{"error":"invalid access token"}`, http.StatusUnauthorized, "invalid access token"},
+		{"status business failure", http.StatusOK, `{"base_resp":{"status_code":1001,"status_msg":"invalid timezone_id"}}`, http.StatusOK, `{"data":{"claim_result":1,"points":400}}`, http.StatusBadGateway, "invalid timezone_id"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stubRegionalCheckin(t, "agent.minimaxi.com", tc.statusCode, tc.statusBody, tc.claimCode, tc.claimBody)
+			result, err := Checkin(context.Background(), &Credential{Region: RegionCN, AccessToken: "fixture-token"}, "")
+			if err == nil || result != nil || !strings.Contains(err.Error(), tc.wantReason) {
+				t.Fatalf("result=%+v, error=%v; want failure with %q", result, err, tc.wantReason)
+			}
+			var problem *core.PluginError
+			if !errors.As(err, &problem) {
+				if !errors.As(core.ToPluginError(err), &problem) {
+					t.Fatalf("error %v has no status", err)
+				}
+			}
+			if problem.HTTPStatus != tc.wantStatus {
+				t.Fatalf("status=%d, want %d (%v)", problem.HTTPStatus, tc.wantStatus, err)
+			}
+		})
+	}
+}
+
+func TestCheckinEmptyCalendarHasNoClaimableActivity(t *testing.T) {
+	for _, region := range []Region{RegionCN, RegionGlobal} {
+		t.Run(string(region), func(t *testing.T) {
+			base := stubCheckinHost(t,
+				`{"base_resp":{"status_code":0},"data":{"days":[]}}`,
+				`{"base_resp":{"status_code":0},"data":{"claim_result":1,"points":400}}`)
+			result, err := Checkin(context.Background(), &Credential{Region: region, AccessToken: "fixture-token"}, base)
+			if err != nil || result == nil || !result.NotRecorded || result.Already || result.Credit != 0 || !strings.Contains(result.Message, "无可领活动") {
+				t.Fatalf("result=%+v, error=%v; want unrecorded empty activity", result, err)
+			}
+		})
+	}
+}
+
+func TestCheckinDoesNotClaimWithoutConfirmedEligibility(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"redirect", 302, `{}`},
+		{"no content", 204, ``},
+		{"malformed", 200, `{`},
+		{"missing days", 200, `{"data":{}}`},
+		{"missing today", 200, `{"data":{"days":[{"is_today":false,"status":2}]}}`},
+		{"missing status", 200, `{"data":{"days":[{"is_today":true}]}}`},
+		{"unknown status", 200, `{"data":{"days":[{"is_today":true,"status":99}]}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			claims := 0
+			hostbridge.Configure(func(_, method string, payload any) (json.RawMessage, error) {
+				raw, _ := json.Marshal(payload)
+				var req struct {
+					URL string `json:"url"`
+				}
+				_ = json.Unmarshal(raw, &req)
+				parsed, _ := url.Parse(req.URL)
+				status, body := http.StatusOK, `{}`
+				if parsed.Path == EpCheckinStatus {
+					status, body = tc.status, tc.body
+				}
+				if parsed.Path == EpCheckinClaim {
+					claims++
+					body = `{"data":{"claim_result":1,"points":400}}`
+				}
+				return json.Marshal(map[string]any{"StatusCode": status, "Body": []byte(body)})
+			})
+			t.Cleanup(func() { hostbridge.Configure(nil) })
+			result, err := Checkin(context.Background(), checkinCredential(), "https://agent.test")
+			if claims != 0 {
+				t.Fatalf("unconfirmed board sent %d claims", claims)
+			}
+			if err == nil && (result == nil || !result.NotRecorded) {
+				t.Fatalf("ambiguous board reported success: %+v", result)
+			}
+		})
 	}
 }

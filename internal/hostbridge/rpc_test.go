@@ -80,3 +80,11 @@ func TestDecodeEnvelope(t *testing.T) {
 		t.Fatal("failed envelope must return an error")
 	}
 }
+
+func TestDecodeEnvelopePreservesUpstreamHTTPStatusAndMessage(t *testing.T) {
+	_, err := DecodeEnvelope([]byte(`{"ok":false,"error":{"code":"host_call_failed","http_status":400,"message":"{\"code\":11158,\"msg\":\"model not allowed for user type\"}"}}`))
+	coded, ok := err.(interface{ StatusCode() int })
+	if !ok || coded.StatusCode() != 400 {
+		t.Fatalf("status was lost: %T %v", err, err)
+	}
+}

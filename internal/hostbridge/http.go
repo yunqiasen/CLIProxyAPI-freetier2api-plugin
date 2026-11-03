@@ -64,10 +64,11 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	payload := rpcHostHTTPRequest{
-		Method:  req.Method,
-		URL:     req.URL.String(),
-		Headers: req.Header,
-		Body:    body,
+		AuthIndex: AuthIndex(ctx),
+		Method:    req.Method,
+		URL:       req.URL.String(),
+		Headers:   req.Header,
+		Body:      body,
 	}
 	method := pluginabi.MethodHostHTTPDo
 	if t.stream {
@@ -141,10 +142,11 @@ func buildResponse(req *http.Request, status int, header http.Header, body io.Re
 // 只填扁平字段（method/url/headers/body）：宿主对扁平与嵌套两种形态都接受，
 // 扁平形态更简单且不容易漏字段。
 type rpcHostHTTPRequest struct {
-	Method  string      `json:"method,omitempty"`
-	URL     string      `json:"url,omitempty"`
-	Headers http.Header `json:"headers,omitempty"`
-	Body    []byte      `json:"body,omitempty"`
+	AuthIndex string      `json:"auth_index,omitempty"`
+	Method    string      `json:"method,omitempty"`
+	URL       string      `json:"url,omitempty"`
+	Headers   http.Header `json:"headers,omitempty"`
+	Body      []byte      `json:"body,omitempty"`
 }
 
 // rpcHostHTTPResponse 是 host.http.do 的响应体。

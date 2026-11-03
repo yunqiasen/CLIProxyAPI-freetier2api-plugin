@@ -181,13 +181,21 @@ type LoginSessions interface {
 
 // ProbeNativeCredential 从宿主凭证中挑第一个属于 vendorID 的可用原生凭证。
 func ProbeNativeCredential[T any](env Env, vendorID string, extract NativeExtractor[T]) (*T, bool) {
+	native, _, ok := ProbeNativeCredentialWithIndex(context.Background(), env, vendorID, extract)
+	return native, ok
+}
+
+// ProbeNativeCredentialWithIndex keeps the selected host identity alongside the token.
+func ProbeNativeCredentialWithIndex[T any](ctx context.Context, env Env, vendorID string, extract NativeExtractor[T]) (*T, string, bool) {
 	if env.Host == nil || env.Registry == nil {
-		return nil, false
+		return nil, "", false
 	}
-	ctx := context.Background()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	entries, errList := env.Host.ListAuths(ctx)
 	if errList != nil {
-		return nil, false
+		return nil, "", false
 	}
 	for _, entry := range entries {
 		if !entry.Usable() {
@@ -202,8 +210,8 @@ func ProbeNativeCredential[T any](env Env, vendorID string, extract NativeExtrac
 			continue
 		}
 		if native, okNative := extract(credential); okNative && native != nil {
-			return native, true
+			return native, entry.AuthIndex, true
 		}
 	}
-	return nil, false
+	return nil, "", false
 }

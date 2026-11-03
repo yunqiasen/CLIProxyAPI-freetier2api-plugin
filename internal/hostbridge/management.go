@@ -5,6 +5,7 @@ package hostbridge
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -35,7 +36,8 @@ func ErrorStatus(err error) int {
 		return http.StatusInternalServerError
 	}
 	type statusCoder interface{ StatusCode() int }
-	if coded, ok := err.(statusCoder); ok {
+	var coded statusCoder
+	if errors.As(err, &coded) {
 		if status := coded.StatusCode(); status > 0 {
 			return status
 		}

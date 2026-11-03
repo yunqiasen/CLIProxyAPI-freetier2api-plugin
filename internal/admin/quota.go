@@ -214,6 +214,7 @@ func (s *Service) runQuotaBatch(done chan struct{}, jobs []quotaJob) {
 //
 // 只负责取数；缓存、领取状态落盘由 runQuotaBatch 统一负责。
 func (s *Service) queryQuota(ctx context.Context, job quotaJob) (*pluginapi.QuotaFetchResponse, error) {
+	ctx = hostbridge.WithAuthIndex(ctx, job.entry.AuthIndex)
 	quotaProvider, okQuota := core.As[core.QuotaProvider](job.vendor)
 	if !okQuota {
 		return nil, core.QuotaUnsupported(job.vendor)
