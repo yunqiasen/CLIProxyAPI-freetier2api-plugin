@@ -272,6 +272,13 @@ input.aliasinput:focus { outline: none; border-color: var(--accent); box-shadow:
 .login-captcha[hidden] { display: none !important; }
 .claim-row { display: flex; gap: 8px; align-items: center; margin-top: 14px; flex-wrap: wrap; }
 
+/* 任务排程：左列活动名（含渠道），右列时间输入，两列网格让输入框对齐成一排。
+   活动有不同渠道专属，名称列用 max-content 保证括号里的渠道名不被截断。 */
+#taskSchedule { display: grid; grid-template-columns: max-content 170px;
+                column-gap: 16px; row-gap: 6px; align-items: center; }
+#taskSchedule .hint { grid-column: 1 / -1; }
+#taskSchedule input[type=text] { width: 100%; min-width: 0; }
+
 /* 折叠块：默认收起，标题行常显。用于任务排程、扫描结果等长列表。 */
 details.fold { border-top: 1px solid var(--border); margin-top: 12px; padding-top: 10px; }
 details.fold > summary { cursor: pointer; font-size: 12.5px; color: var(--muted);
@@ -297,6 +304,9 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
      窄屏本来也没有吸顶价值。 */
   #accounts, #scans .table-scroll { overflow-x: auto; }
   #models table { min-width: 820px; }
+  /* 窄屏下名称列可压缩，时间列收窄，避免两列撑出横向滚动条。 */
+  #taskSchedule { grid-template-columns: 1fr 120px; column-gap: 10px; }
+  #taskSchedule label { min-width: 0; }
 }
 
 /* 响应式：手机（≤640px）。 */
@@ -1428,21 +1438,19 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     title.className = "hint";
     title.textContent = "逗号分隔整点小时（0-23），留空使用默认值";
     host.appendChild(title);
+    // 任务名后面标出归属渠道：排程是全局的，但夜猫子/开学季这类活动只有
+    // 单个客户端有实现，不标出来根本不知道填了会不会白跑。
     specs.forEach(function (spec) {
-      var row = document.createElement("div");
-      row.className = "row";
-      row.style.marginTop = "6px";
       var label = document.createElement("label");
-      label.textContent = (spec.label || spec.kind) + " ";
+      label.textContent = (spec.label || spec.kind) +
+        (spec.vendor ? "（" + spec.vendor + "）" : "");
       var input = document.createElement("input");
       input.type = "text";
       input.dataset.taskKind = spec.kind;
       input.placeholder = (spec.default_hours || []).join(",");
       input.value = (schedule[spec.kind] || []).join(",");
-      input.style.width = "180px";
-      label.appendChild(input);
-      row.appendChild(label);
-      host.appendChild(row);
+      host.appendChild(label);
+      host.appendChild(input);
     });
   }
 

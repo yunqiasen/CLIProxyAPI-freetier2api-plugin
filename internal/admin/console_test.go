@@ -686,6 +686,20 @@ func TestConsoleModelOptionalColumnsHiddenByDefault(t *testing.T) {
 	}
 }
 
+// TestConsoleScheduleShowsVendorOwnership 锁定任务排程的归属标注与两列对齐：
+// 活动名必须带出客户端渠道，输入框靠网格排在右侧同一列。
+func TestConsoleScheduleShowsVendorOwnership(t *testing.T) {
+	page := Page("/plugins/freetier2api")
+	for _, required := range []string{
+		`spec.vendor ? "（" + spec.vendor + "）"`,
+		`#taskSchedule { display: grid;`,
+	} {
+		if !strings.Contains(page, required) {
+			t.Fatalf("console page missing %q", required)
+		}
+	}
+}
+
 func TestConsolePageSettingsLabelsAndDisclaimer(t *testing.T) {
 	page := Page("/plugins/freetier2api")
 	for _, required := range []string{

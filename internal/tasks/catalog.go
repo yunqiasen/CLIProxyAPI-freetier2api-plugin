@@ -22,8 +22,10 @@ func (c *Catalog) Specs() []core.TaskSpec {
 	if c.anyCheckin() {
 		seen[core.TaskKindCheckin] = true
 		out = append(out, core.TaskSpec{
-			Kind:         core.TaskKindCheckin,
-			Label:        "每日签到",
+			Kind:  core.TaskKindCheckin,
+			Label: "每日签到",
+			// 签到是各渠道各自实现的通用族，不归属任何单一客户端。
+			Vendor:       "全部渠道",
 			Description:  "对所有支持签到的账号执行签到",
 			DefaultHours: []int{9, 21},
 			Manual:       true,
@@ -40,6 +42,15 @@ func (c *Catalog) Specs() []core.TaskSpec {
 				continue
 			}
 			spec.Kind = kind
+			// 归属默认取声明它的供应商展示名；供应商自己填了（例如跨供应商
+			// 共用的族）就尊重它。keepalive 由引擎对所有账号统一执行，不该
+			// 被误标成「只有某家能做」。
+			if spec.Vendor == "" {
+				spec.Vendor = vendor.Name()
+			}
+			if kind == core.TaskKindKeepalive {
+				spec.Vendor = "全部渠道"
+			}
 			spec.DefaultHours = NormalizeHours(spec.DefaultHours)
 			seen[kind] = true
 			out = append(out, spec)

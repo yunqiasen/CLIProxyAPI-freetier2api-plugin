@@ -6,8 +6,12 @@ import (
 )
 
 type TaskSpec struct {
-	Kind         string `json:"kind"`
-	Label        string `json:"label"`
+	Kind  string `json:"kind"`
+	Label string `json:"label"`
+	// Vendor 是这个任务族归属的供应商展示名（如「WorkBuddy 国内版」）。
+	// 排程是全局的，控制台必须能看出某个活动是哪个客户端专属的，否则
+	// 「夜猫子 / 开学季」这类单客户端活动无从判断。全渠道通用的族写「全部渠道」。
+	Vendor       string `json:"vendor,omitempty"`
 	Description  string `json:"description,omitempty"`
 	DefaultHours []int  `json:"default_hours,omitempty"`
 	AfterCheckin bool   `json:"after_checkin,omitempty"`
