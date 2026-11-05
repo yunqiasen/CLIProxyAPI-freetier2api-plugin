@@ -13,15 +13,17 @@
 
 如果这个项目帮到了你，欢迎点个 Star 支持一下。
 
-> **⚠️ 重要合规提示**：本项目**仅限个人学习与技术研究使用**，严禁用于任何商业售卖、API 转售、代充代刷、公开/收费共享池或任何违反各上游平台服务条款与法律法规的用途。单个供应商硬性限制最多添加 **10 个**账号。继续使用即表示您已阅读并同意文末[免责声明](#免责声明)。
+> **本仓库说明**：上游 `jiandanc/CLIProxyAPI-freetier2api-plugin` 已随作者账号一并从 GitHub 消失（账号与仓库均为 404）。本仓库自 **v0.1.29** 起由 `cxy2730` 接手维护，插件 ID 仍为 `freetier`，已有安装可直接覆盖升级。仓库已从 fork 网络脱离，是独立仓库；完整提交历史保留，`v0.1.44` 及更早的 tag 只存在于归档仓库 `cxy2730/CLIProxyAPI-freetier2api-plugin-legacy`，本仓库从 `v0.1.45` 起继续发版。
 
 ## 功能特性
 
 - 复用宿主 Anthropic `/v1/messages`、OpenAI `/v1/chat/completions` 与 OpenAI `/v1/responses` 接口，无需额外部署独立网关
-- 支持 8 大体系共 15 个国内外免费额度供应商实例（AutoClaw 国内/国际与小浣熊已接入），凭证严格按供应商隔离（单供应商上限 10 个账号）
+- 支持 8 大体系共 15 个国内外免费额度供应商实例（AutoClaw 国内/国际与小浣熊已接入），凭证严格按供应商隔离，账号数量不设上限
 - 模型清单动态探测、自定义模型别名与跨供应商同名模型自动负载均衡/故障转移
-- 内嵌单页 Web 控制台：支持 OAuth 设备授权 / 本地回调粘贴 / API Key 添加账号、账号自定义别名、账号批量启停/删除、额度可视化、签到历史回溯、模型启停与运行日志
-- 支持每日自动签到、每日自动任务与 Token 自动续期保活
+- 内嵌单页 Web 控制台：OAuth 设备授权 / 本地回调粘贴 / API Key 添加账号、账号别名、批量启停删除、额度可视化、签到、模型启停与设置（任务中心与运行日志页已移除，日志统一走宿主官方页）
+- 请求体原样透传：不注入、不替换、不追加任何提示词，也不改写 `system` / `tools` / 采样参数
+- 支持每日自动签到、每日自动任务与 Token 自动续期保活（签到记录只保留当天，跨天自动清空）
+- 不在宿主面板注册 OAuth 登录项：插件不出现在 CLIProxyAPI「OAuth 登录」列表里，加账号与登录一律走插件控制台
 - 纯 Go 标准库实现，零第三方运行时依赖
 
 ## 支持的供应商
@@ -45,27 +47,25 @@
 | `minimaxcodecn` | MiniMax Code 国内版 | `cn` | OAuth 设备授权 | `minimaxcodecn-*.json` |
 | `minimaxcodeglobal` | MiniMax Code 国际版 | `global` | OAuth 设备授权 | `minimaxcodeglobal-*.json` |
 
-> 旧 ZCode 凭证 `zcode-*.json` 仍可加载：按 `region` 归属，缺 `region` 默认国际版，文件名保持不变；`disabled_models` 与模型别名里已有的 `zcode:<模型>` 也继续映射到 `zcodeglobal`（拆分前只有国际版）。
-
 ## 快速开始
 
-### 方式一：通过 CPA 插件商店安装（推荐）
+### 方式一：通过 CPA 插件商店安装
 
-本插件已收录至 CLIProxyAPI 官方插件源：
+本插件曾收录于 CLIProxyAPI 官方插件源，但插件源里的条目目前仍指向已失效的原仓库地址，一键安装会失败，待插件源更新后恢复：
 
 1. 打开 CLIProxyAPI 管理面板 → **插件商店**。
-2. 搜索 **FreeTier 2API** 并点击一键安装。
+2. 搜索 **FreeTier 2API** 并点击一键安装（条目恢复前请用方式二）。
 
 ### 方式二：手动安装 Release 动态库
 
-从 [Releases](https://github.com/jiandanc/CLIProxyAPI-freetier2api-plugin/releases) 下载对应平台的归档包，解压后将动态库（`freetier2api.so` / `freetier2api.dylib` / `freetier2api.dll`）放入 CPA 插件目录，并在 `config.yaml` 中启用：
+从 [Releases](https://github.com/cxy2730/CLIProxyAPI-freetier2api-plugin/releases) 下载对应平台的归档包，解压后将动态库（`freetier.so` / `freetier.dll`）放入 CPA 插件目录，并在 `config.yaml` 中启用：
 
 ```yaml
 plugins:
   enabled: true
   dir: "/path/to/cpa/plugins"
   configs:
-    freetier2api:
+    freetier:
       enabled: true
       enabled_realms: "cn,global"
 ```
@@ -75,12 +75,12 @@ plugins:
 需 Go 1.22+ 与 C 编译器（启用 `CGO_ENABLED=1`），或直接使用仓库内置的 Docker 构建脚本（基于 `golang:1.24` Debian glibc 镜像）：
 
 ```bash
-git clone https://github.com/jiandanc/CLIProxyAPI-freetier2api-plugin.git
+git clone https://github.com/cxy2730/CLIProxyAPI-freetier2api-plugin.git
 cd CLIProxyAPI-freetier2api-plugin
 ./scripts/build.sh
 ```
 
-编译产物输出至 `dist/freetier2api.<so|dylib|dll>`。
+编译产物输出至 `dist/freetier.<so|dylib|dll>`。
 
 ## 使用方法
 
@@ -89,34 +89,34 @@ cd CLIProxyAPI-freetier2api-plugin
 启动 CLIProxyAPI 后，访问内嵌控制台页面：
 
 ```text
-http://<CPA地址>:8317/v0/resource/plugins/freetier2api/console
+http://<CPA地址>:8317/v0/resource/plugins/freetier/console
 ```
 
-- 点击 **「添加账号 ▾」** 选择对应供应商，按提示在浏览器完成 OAuth 授权或填入 API Key（每个供应商最多可添加 10 个账号）。
+- 点击 **「添加账号 ▾」** 选择对应供应商，按提示在浏览器完成 OAuth 授权或填入 API Key（账号数量不设上限）。
 - 若在远程服务器 / Docker / WSL 部署，使用 Trae 或 CodeArts 登录时浏览器停留在 `127.0.0.1` 回调页，展开登录框下方的 **「回调没到插件？粘贴回调链接」**，将完整回调 URL 粘贴提交即可。
 
 ### 2. 调用 API
 
-账号添加后即可通过 CLIProxyAPI 标准接口调用（支持裸模型名或 `<vendor>:<model>` 前缀指定供应商）：
+账号添加后即可通过 CLIProxyAPI 标准接口调用。模型对外 ID 固定为 `<供应商前缀>-<上游模型名>`，前缀写死不可配置，例如 `qodercn-GLM-5.3`、`workbuddyglobal-deepseek-v4.1-flash`，完整清单用 `GET /v1/models` 取：
 
 ```bash
 # OpenAI Chat Completions
 curl http://localhost:8317/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <CPA_API_KEY>" \
-  -d '{"model":"GLM-5.3","messages":[{"role":"user","content":"你好！"}]}'
+  -d '{"model":"qodercn-GLM-5.3","messages":[{"role":"user","content":"你好！"}]}'
 
 # Anthropic Messages
 curl http://localhost:8317/v1/messages \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
   -H "x-api-key: <CPA_API_KEY>" \
-  -d '{"model":"GLM-5.3-Flash","max_tokens":1024,"messages":[{"role":"user","content":"你好！"}]}'
+  -d '{"model":"qodercn-GLM-5.3-Flash","max_tokens":1024,"messages":[{"role":"user","content":"你好！"}]}'
 ```
 
 ### 3. 模型别名与跨供应商路由
 
-在控制台「模型」表格中点击 **「模型 ID」** 列的名称或 `✎` 图标即可设置对外模型别名。将不同供应商的模型设为同一别名（例如把多家供应商的旗舰模型统一设为 `coding-max`），宿主会自动合并并在多个供应商间负载均衡与故障转移。开启 `model_name_tag` 后对外 ID 带渠道标识，同名模型不再跨供应商合并。
+在控制台「模型」表格中点击 **「模型 ID」** 列的名称或 `✎` 图标即可设置对外模型别名。将不同供应商的模型设为同一别名（例如把多家供应商的旗舰模型统一设为 `coding-max`），宿主会自动合并并在多个供应商间负载均衡与故障转移。
 
 ### 4. 账号别名
 
@@ -124,40 +124,9 @@ curl http://localhost:8317/v1/messages \
 
 别名按**账号身份**（凭据文件名，即 `state.json` 里的 `account_aliases` 键）记录，与上游昵称、token 无关，因此 token 刷新、重登写回同一凭证文件后别名都不会丢。
 
-### 5. 账号批量操作
-
-账号表与模型表一样有勾选列，顶部按钮依次是 **添加账号 / 禁用选中 / 启用选中 / 全选 / 清空 / Token续期 / 查询额度 / 一键签到 / 一键做任务 / 删除**，末尾的筛选框按供应商、账号名、别名或文件名过滤（不匹配任何凭证内容）：
-
-- 默认全部未勾选。此时「删除」按钮禁用，Token续期、查询额度、一键签到、一键做任务作用于**全部账号**；
-- 勾选后，上述动作只作用于选中的账号；勾选状态在表格刷新后保留，已消失的账号自动出列；
-- 筛选只影响「看得到哪些行」：全选/清空作用于当前可见的行，已被筛掉的账号不会丢勾选，批量动作也仍按完整勾选集合执行；
-- 禁用不是删除：只在凭证 JSON 上写宿主的 `disabled` 标记（token 与文件都保留，随时可再启用），删除才会移除凭证文件；
-- 「删除」仍需点两次：第一次进入确认态（5 秒后自动复位），第二次才真正删除。
-
-### 6. CodeArts 签到与推理通道
-
-福利领取合并在既有 **「一键签到」** 与 **「每日自动签到」** 中：在账号表勾选 CodeArts 账号后点击顶部「一键签到」，无需单独的领取按钮。
-
-积分签到与免费福利 Token 是两份独立权益。插件先读取上游 `benefit-gateway-config`：只有 `enabled: true` 才会领取福利 Token；积分已签到、没有积分活动或积分领取失败，不会跳过已开放的福利领取。通道关闭时仅处理积分签到，并明确显示「免费福利通道未开放」。签到不能恢复上游关闭的福利权益。
-
-同一插件进程内，同一账号在同一个北京时间日期领取成功后，后续签到返回「已领取」并跳过重复领取请求；失败不缓存，仍可重试。该成功证明仅在当前进程内有效：重启后会重新查询上游，不把 `4000`、`4006` 或积分签到成功猜成福利已领取。任一链路失败会保留完整原因，不记为当日全部完成。查询额度、刷新模型均不触发领取。
-
-**积分推理默认关闭。** 如明确同意消耗 CodeArts 账号积分，在宿主 `config.yaml` 中开启：
-
-```yaml
-plugins:
-  configs:
-    freetier2api:
-      codearts_credit_enabled: true
-```
-
-配置生效后刷新模型目录。开启时只从账号实际的内置目录获取模型，推理不发送 `maas_type: benefit`，按上游积分规则计费；关闭、未配置或配置值非法时保留原有福利通道。两种模式不会因调用失败而自动互相切换，也不会自动选另一个模型。需要固定供应商时使用 `codearts:<模型ID>`。
-
-目前实测（2026-10-31）福利网关返回 `enabled: false`，旧福利领取接口返回 `4000 invalid channel, group not found`；同一账号的 `deepseek-v4.1-flash-1017` 积分通道可正常回答。此时补领福利无法修复推理，需由用户明确选择是否启用积分通道。自动签到设置仍为 `auto_checkin` / `auto_checkin_at`。
-
 ## 配置说明
 
-在宿主 `config.yaml` 的 `plugins.configs.freetier2api` 下可配置以下常用项（大多数运行期设置可直接在控制台页面调整并即时生效）：
+在宿主 `config.yaml` 的 `plugins.configs.freetier` 下可配置以下常用项（大多数运行期设置可直接在控制台页面调整并即时生效）：
 
 | 配置键 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
@@ -165,14 +134,16 @@ plugins:
 | `auto_checkin` | bool | `true` | 每日自动签到开关 |
 | `auto_checkin_at` | string | `10:00` | 每日自动签到时间（`HH:MM`，本地时区）。排程粒度为整点，分钟不为 0 时顺延到下一整点，保证不会早于设定时刻执行 |
 | `auto_tasks` | bool | `true` | 每日自动任务开关 |
+| `auto_raccoon_daily_grant` | bool | `true` | 小浣熊「每日积分」任务开关：每日调用网页端 `setting_info` 触发服务器发放当日每日积分（幂等，已发不重复；默认 08:00 执行） |
 | `codearts_credit_enabled` | bool | `false` | 明确开启 CodeArts 积分推理（消耗账号积分）；默认福利通道，失败不自动切换。修改后刷新模型目录 |
-| `checkin_history_limit` | int | `30` | 每个账号保留的签到历史条数（`<=0` 用默认值 30；控制台签到列可展开查看） |
-| `prompt_mode` | string | `passthrough` | 提示词防御模式：`passthrough`（透传）/ `custom`（替换）/ `append`（追加） |
-| `model_name_tag` | string | `off` | 模型名渠道标识：`off`（默认）/ `prefix` / `suffix`。开启后各供应商的模型对外 ID 自动带渠道前缀或后缀（如 `zcodeglobal-GLM-5.3`），同名模型可按渠道定点选择；标识按供应商统一生成、不区分账号。改动后需宿主重建模型注册表生效（重启或等凭据重载，控制台会提示「待生效」） |
 | `disabled_models` | string / list | 空 | 禁用模型列表（支持 `vendor:model` 或裸名，与控制台勾选合并） |
 | `extra_models` | string | 空 | 额外补充注册的模型名（逗号分隔） |
-| `state_dir` | string | `~/.freetier2api-plugin` | 状态与缓存目录（若存在 `~/.cli-proxy-api` 则默认使用其下 `freetier2api` 子目录） |
+| `state_dir` | string | `~/.freetier-plugin` | 状态与缓存目录（若存在 `~/.cli-proxy-api` 则默认使用其下 `freetier` 子目录） |
 | `log_level` | string | `info` | 日志级别：`debug` / `info` / `error` |
+| `log_to_file` | bool | `false` | 额外把日志写入 `<state_dir>/logs/`，按天分文件 |
+| `log_to_host` | bool | `true` | 把插件日志镜像进宿主 `main.log`，CLIProxyAPI 面板的日志页可直接查看 |
+| `host_log_file` | string | 自动探测 | 宿主日志文件路径。留空时按 `state_dir` 反推 `<base>/auths/logs/main.log` 或 `<base>/logs/main.log`，都不存在则不启用 |
+| `host_log_level` | string | `info` | 镜像到宿主日志的最低级别：`debug` / `info` / `error` |
 
 ## 项目架构
 
@@ -211,13 +182,6 @@ package main / cgo        C ABI 入口（main.go / cgo.go）
 ## 参与贡献
 
 欢迎友好交流。遇到问题时，建议先让 Claude Code、Codex 等工具帮忙排查一下，大部分问题都能自己解决。如果能直接提个 PR 就更好了。
-
-## 免责声明
-
-1. **仅限个人学习与研究**：本项目仅用于个人学习、技术交流与协议互操作性研究，严禁将本项目（或其编译产物、衍生服务）用于任何形式的商业售卖、API 转售、有偿代搭、代刷代充、公开算力池分发或任何非法用途。
-2. **无官方关联**：本项目为独立开源项目，与腾讯（WorkBuddy / CodeBuddy）、阿里（Qoder）、智谱 / Z.AI（ZCode、AutoClaw）、字节跳动（Trae）、华为云（CodeArts）、MiniMax、商汤（小浣熊）、Cline、OpenCode 等任何上游厂商均无任何隶属、合作或背书关系。
-3. **合规与风险自负**：通过非官方客户端调用接口、执行自动签到或自动任务可能违反各上游平台的用户服务协议（ToS），并可能导致账号受限、积分清零、封禁或其他法律与合规风险。使用者必须在合法合规及个人自用范围内使用本项目，因使用或滥用本项目产生的一切直接或间接后果均由使用者本人承担，项目作者及贡献者不承担任何责任。
-4. **权利人联系**：如任何上游平台或权利人认为本项目中的部分实现影响了您的合法权益，请通过 Issue 联系作者，我们将在核实后第一时间移除相关供应商适配代码。
 
 ## 许可证
 

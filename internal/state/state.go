@@ -39,10 +39,15 @@ type CheckinRecord struct {
 	Streak   int64  `json:"streak,omitempty"`
 	Credit   int64  `json:"credit,omitempty"`
 	Energy   int64  `json:"energy,omitempty"`
+	// ProvisionalDate 是「上游声称今日已签到、但还没到可信时刻」的日期。
+	//
+	// 上游在每日零点刚过的几十分钟里会对**尚未领到**的账号返回「已签到」
+	// （magpie #3326 实测：北京 00:00:28 六家渠道集体误报，10:54 才真领到，
+	// 29 个账号中 14 个）。若此时就写 LastDate，页面会显示假性成功，用户
+	// 以为今天领过了。这里只记一笔「待复核」，LastDate 留空，等过了可信
+	// 时刻再问一次；那时若仍是「已签到」，才认为当天确实领到了。
+	ProvisionalDate string `json:"provisional_date,omitempty"`
 }
-
-// DefaultCheckinHistoryLimit 是每个账号默认保留的签到历史条数。
-const DefaultCheckinHistoryLimit = 30
 
 // CheckinHistoryEntry 是一次签到执行的记录（滚动历史，每个账号只留最近若干条）。
 //
@@ -81,6 +86,15 @@ func CheckinHistoryKey(vendorID, accountID string) string {
 // 同一份形状，供应商改字段时这里不用跟着改。
 type ClaimRecord struct {
 	pluginapi.ClaimStatus
+	// Note 是给页面看的说明，不是失败原因。
+	//
+	// 例如「已领取，上游暂未返回额度明细」「有可领取的套餐，领取后才会生成
+	// 额度」。这类文案既不是错误，也不影响能否点击领取；塞进 Error 会让页面
+	// 把「已领取」的账号显示成「可以再领一次」。
+	//
+	// 它是插件自有字段，不进宿主契约（ClaimStatus 是宿主的）：说明文案是
+	// 展示层的事，宿主不需要知道。
+	Note string `json:"note,omitempty"`
 	// CheckedAt 是本次探测时间（RFC3339），页面据此显示「多久前查的」。
 	CheckedAt string `json:"checked_at,omitempty"`
 }
@@ -96,12 +110,13 @@ type State struct {
 	AutoCheckin   *bool  `json:"auto_checkin,omitempty"`
 	AutoCheckinAt string `json:"auto_checkin_at,omitempty"`
 	AutoTasks     *bool  `json:"auto_tasks,omitempty"`
-	// PromptMode 是页面上改过的提示词过滤模式；空表示沿用 YAML 配置。
-	PromptMode string `json:"prompt_mode,omitempty"`
 	// ModelNameTag 是页面上改过的模型名渠道标识模式（off/prefix/suffix）；
 	// 空表示沿用 YAML 配置。
 	ModelNameTag string `json:"model_name_tag,omitempty"`
 
+	// AutoRaccoonDailyGrant 开启小浣熊「每日积分」任务（网页端 setting_info）。
+	// nil = 未设置，回落配置默认值。
+	AutoRaccoonDailyGrant *bool `json:"auto_raccoon_daily_grant,omitempty"`
 	// TaskSchedules 是按任务族保存的整点小时列表（0-23）。
 	// 新代码只读写这个字段；下面五个字段仅用于读取旧状态并迁移。
 	TaskSchedules map[string][]int `json:"task_schedules,omitempty"`
@@ -213,7 +228,7 @@ func (s *Store) Load() (*State, error) {
 		// 但损坏的文件不能就地覆盖——它是唯一可能被手工救回的东西，
 		// 改名留存，下一次写入才不会把它抹掉。
 		quarantined := quarantine(path)
-		logger.Error("state file %s is corrupt, quarantined as %s, starting with empty state: %v", path, quarantined, errUnmarshal)
+		logger.Error("状态文件 %s 已损坏，已隔离为 %s，以空状态启动：%v", path, quarantined, errUnmarshal)
 		s.cache = New()
 		return s.cache, nil
 	}
@@ -382,7 +397,7 @@ func (s *Store) flush() {
 	}
 	if errSave := s.saveLocked(); errSave != nil {
 		// 保留 dirty：下一次 Mutate 或 Flush 会再试一次。
-		logger.Error("save state failed: %v", errSave)
+		logger.Error("保存状态失败：%v", errSave)
 		return
 	}
 	s.dirty = false
@@ -446,7 +461,7 @@ func backup(path string) {
 		return
 	}
 	if errWrite := os.WriteFile(bak, raw, 0o600); errWrite != nil {
-		logger.Error("backup state failed: %v", errWrite)
+		logger.Error("备份状态失败：%v", errWrite)
 	}
 }
 
@@ -454,7 +469,7 @@ func backup(path string) {
 func quarantine(path string) string {
 	target := fmt.Sprintf("%s.corrupt-%s", path, time.Now().Format("20060102-150405"))
 	if errRename := os.Rename(path, target); errRename != nil {
-		logger.Error("quarantine corrupt state failed: %v", errRename)
+		logger.Error("隔离损坏状态文件失败：%v", errRename)
 		return ""
 	}
 	return target

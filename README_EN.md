@@ -13,15 +13,17 @@ A native dynamic library plugin that connects multiple free-tier AI providers to
 
 If this project helps you, a Star would mean a lot.
 
-> **⚠️ Important Compliance Notice**: This project is **strictly for personal learning and technical research only**. Commercial sale, API resale, paid account farming, public/paid shared pools, or any use violating upstream Terms of Service or applicable laws is strictly prohibited. Each provider is hard-limited to a maximum of **10 accounts**. By using this software, you agree to the [Disclaimer](#disclaimer) below.
+> **About this repository**: the original repository `jiandanc/CLIProxyAPI-freetier2api-plugin` disappeared from GitHub together with its owner's account (both the account and the repository return 404). This repository continues that line; from **v0.1.29** onward it is maintained by `cxy2730`. The plugin ID stays `freetier`, so existing installations can upgrade in place. History and all tags up to `v0.1.28` are preserved.
 
 ## Features
 
 - Native integration with CLIProxyAPI's Anthropic `/v1/messages`, OpenAI `/v1/chat/completions`, and OpenAI `/v1/responses` endpoints without running a separate gateway service
-- Supports 15 free-tier provider instances across 8 vendor families (AutoClaw CN/Global and Raccoon included) with strict per-vendor credential isolation (capped at 10 accounts per provider)
+- Supports 15 free-tier provider instances across 8 vendor families (AutoClaw CN/Global and Raccoon included) with strict per-vendor credential isolation and no account cap
 - Dynamic model catalog discovery, custom model aliases, and cross-provider load balancing / failover
-- Built-in single-page Web console for OAuth device login, localhost callback paste, API Key import, account aliases and batch enable/disable/delete, quota tracking, check-in history, model toggling, and live logs
-- Automated daily check-in, automated daily tasks, and token keepalive refresh
+- Built-in single-page Web console for OAuth device login, localhost callback paste, API Key import, account aliases, batch enable/disable/delete, quota tracking, check-in, model toggling, and settings (the task center and log page were removed; logs live in the host UI)
+- Request bodies pass through untouched: no prompt injection, replacement, or appending, and no rewriting of `system` / `tools` / sampling parameters
+- Automated daily check-in, automated daily tasks, and token keepalive refresh (check-in history keeps today only and is cleared on day change)
+- No OAuth login entry in the host panel: the plugin is intentionally absent from CLIProxyAPI’s "OAuth login" list, so accounts are added from the plugin console only
 - Pure Go standard library implementation with zero third-party runtime dependencies
 
 ## Supported Providers
@@ -45,27 +47,25 @@ If this project helps you, a Star would mean a lot.
 | `minimaxcodecn` | MiniMax Code CN | `cn` | OAuth Device Flow | `minimaxcodecn-*.json` |
 | `minimaxcodeglobal` | MiniMax Code Global | `global` | OAuth Device Flow | `minimaxcodeglobal-*.json` |
 
-> Legacy ZCode credentials (`zcode-*.json`) still load: routed by `region`, defaulting to Global when absent, and the file name is kept unchanged. Existing `zcode:<model>` entries in `disabled_models` and model aliases keep resolving to `zcodeglobal` (only the global realm existed before the split).
-
 ## Quick Start
 
-### Option 1: Install via CPA Plugin Store (Recommended)
+### Option 1: Install via CPA Plugin Store
 
-This plugin is listed in the official CLIProxyAPI plugin registry:
+This plugin was listed in the official CLIProxyAPI plugin registry, but that entry still points at the now-dead original repository, so one-click install fails until the registry is updated:
 
 1. Open the CLIProxyAPI Admin Panel → **Plugin Store**.
-2. Search for **FreeTier 2API** and click Install.
+2. Search for **FreeTier 2API** and click Install (use Option 2 until the entry is fixed).
 
 ### Option 2: Manual Installation from Releases
 
-Download the archive for your platform from [Releases](https://github.com/jiandanc/CLIProxyAPI-freetier2api-plugin/releases), extract the shared library (`freetier2api.so` / `freetier2api.dylib` / `freetier2api.dll`) into your CPA plugins directory, and enable it in `config.yaml`:
+Download the archive for your platform from [Releases](https://github.com/cxy2730/CLIProxyAPI-freetier2api-plugin/releases), extract the shared library (`freetier.so` / `freetier.dylib` / `freetier.dll`) into your CPA plugins directory, and enable it in `config.yaml`:
 
 ```yaml
 plugins:
   enabled: true
   dir: "/path/to/cpa/plugins"
   configs:
-    freetier2api:
+    freetier:
       enabled: true
       enabled_realms: "cn,global"
 ```
@@ -75,12 +75,12 @@ plugins:
 Requires Go 1.22+ and a C compiler (`CGO_ENABLED=1`), or use the bundled Docker build script (`golang:1.24` Debian glibc image):
 
 ```bash
-git clone https://github.com/jiandanc/CLIProxyAPI-freetier2api-plugin.git
+git clone https://github.com/cxy2730/CLIProxyAPI-freetier2api-plugin.git
 cd CLIProxyAPI-freetier2api-plugin
 ./scripts/build.sh
 ```
 
-The compiled shared library is written to `dist/freetier2api.<so|dylib|dll>`.
+The compiled shared library is written to `dist/freetier.<so|dylib|dll>`.
 
 ## Usage
 
@@ -89,10 +89,10 @@ The compiled shared library is written to `dist/freetier2api.<so|dylib|dll>`.
 Once CLIProxyAPI is running, open the embedded console:
 
 ```text
-http://<CPA-HOST>:8317/v0/resource/plugins/freetier2api/console
+http://<CPA-HOST>:8317/v0/resource/plugins/freetier/console
 ```
 
-- Click **"添加账号 ▾" (Add Account)**, choose a provider, and complete the browser OAuth flow or enter an API Key (up to 10 accounts per provider).
+- Click **"添加账号 ▾" (Add Account)**, choose a provider, and complete the browser OAuth flow or enter an API Key (no account cap).
 - When running on a remote host, Docker, or WSL where `127.0.0.1` callbacks (such as Trae or CodeArts) cannot reach the container directly, expand **"回调没到插件？粘贴回调链接"** in the login box and paste the full localhost callback URL from your browser's address bar.
 
 ### 2. Call the API
@@ -104,14 +104,14 @@ Call standard CLIProxyAPI endpoints using bare model names or `<vendor>:<model>`
 curl http://localhost:8317/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <CPA_API_KEY>" \
-  -d '{"model":"GLM-5.3","messages":[{"role":"user","content":"Hello!"}]}'
+  -d '{"model":"qodercn-GLM-5.3","messages":[{"role":"user","content":"Hello!"}]}'
 
 # Anthropic Messages
 curl http://localhost:8317/v1/messages \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
   -H "x-api-key: <CPA_API_KEY>" \
-  -d '{"model":"GLM-5.3-Flash","max_tokens":1024,"messages":[{"role":"user","content":"Hello!"}]}'
+  -d '{"model":"qodercn-GLM-5.3-Flash","max_tokens":1024,"messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
 ### 3. Model Aliases & Cross-Provider Routing
@@ -124,40 +124,9 @@ The Accounts table shows whatever nickname or email the upstream returns, and so
 
 Aliases are stored in `state.json` under `account_aliases`, keyed by account identity (the credential file name, i.e. `core.Credential.FileID`) rather than by nickname or token, so they survive token refresh and re-login into the same credential file.
 
-### 5. Account Batch Actions
-
-The Accounts table has a selection column like the Models table. The toolbar reads **Add account / Disable selected / Enable selected / Select all / Clear / Token refresh / Query quota / Check in / Run tasks / Delete**, followed by a filter box that matches provider, account name, alias or file name (never credential contents):
-
-- Nothing is selected by default. Delete is disabled while the selection is empty, and Token refresh, Query quota, Check in and Run tasks act on **all accounts**;
-- With a selection, those actions only touch the selected accounts. The selection survives table refreshes, and accounts that disappear drop out of it automatically;
-- Filtering only changes which rows are visible: Select all / Clear act on the visible rows, accounts hidden by the filter keep their selection, and batch actions still run against the full selection;
-- Disabling is not deleting: it only writes the host's `disabled` flag into the credential JSON (token and file are kept, so it is reversible). Delete removes the credential file;
-- Delete still takes two clicks: the first arms the button (auto-reset after 5 seconds), the second deletes.
-
-### 6. CodeArts Check-in and Inference Channels
-
-Benefit claims use the existing **Check in** toolbar action and **daily automatic check-in**. Select the CodeArts account and click Check in; no separate claim button is added.
-
-Credit check-in and free benefit tokens are independent entitlements. The plugin reads `benefit-gateway-config` and only claims tokens when `enabled: true`. Already-completed credit check-ins, missing credit campaigns, and credit-claim failures do not skip an available benefit claim. When the gateway is disabled, only credit check-in runs and the result explicitly says the free benefit channel is unavailable. Check-in cannot restore upstream entitlements that have been disabled.
-
-Within one plugin process, a successful benefit claim is remembered per account and Beijing calendar day. Further check-ins return "already claimed" without another claim request. Failures remain retryable. After restart the process queries upstream again; `4000`, `4006`, or a successful credit check-in are never treated as proof that benefit tokens were claimed. Partial failures keep both outcomes and do not mark the entire day complete. Quota queries and model refreshes do not claim benefits.
-
-**Credit inference is disabled by default.** To explicitly allow consumption of the account's CodeArts credits, configure the host's `config.yaml`:
-
-```yaml
-plugins:
-  configs:
-    freetier2api:
-      codearts_credit_enabled: true
-```
-
-Refresh the model catalog after the configuration takes effect. Enabled mode uses only the account's actual built-in catalog, omits `maas_type: benefit` on inference, and consumes credits according to upstream billing. A missing, false, or invalid setting retains the existing benefit channel. Failed requests never switch channels or choose another model automatically. Use `codearts:<modelID>` when routing must stay with this vendor.
-
-Observed on 2026-10-31: the benefit gateway returned `enabled: false`, legacy claim requests returned `4000 invalid channel, group not found`, and the same account successfully used `deepseek-v4.1-flash-1017` on the credit channel. Claiming benefits cannot repair inference in that state; credit mode requires explicit operator opt-in. Automatic check-in continues to use `auto_checkin` / `auto_checkin_at`.
-
 ## Configuration
 
-Configure under `plugins.configs.freetier2api` in `config.yaml` (runtime settings can also be toggled live in the web console):
+Configure under `plugins.configs.freetier` in `config.yaml` (runtime settings can also be toggled live in the web console):
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -165,14 +134,16 @@ Configure under `plugins.configs.freetier2api` in `config.yaml` (runtime setting
 | `auto_checkin` | bool | `true` | Enable automated daily check-in |
 | `auto_checkin_at` | string | `10:00` | Daily check-in time (`HH:MM`, local time). Scheduling is hourly, so any minute above 0 rounds up to the next hour and the run never fires before the configured time |
 | `auto_tasks` | bool | `true` | Enable automated daily tasks |
+| `auto_raccoon_daily_grant` | bool | `true` | Enable the raccoon daily-points task: calls the web `setting_info` endpoint once a day to have the server grant that day's points (idempotent; runs at 08:00 by default) |
 | `codearts_credit_enabled` | bool | `false` | Explicitly enable credit-billed CodeArts inference; no automatic channel fallback. Refresh models after changing |
-| `checkin_history_limit` | int | `30` | Check-in records kept per account (`<=0` falls back to 30; expandable in the console) |
-| `prompt_mode` | string | `passthrough` | System prompt filter mode: `passthrough` / `custom` / `append` |
-| `model_name_tag` | string | `off` | Channel tag on model IDs: `off` (default) / `prefix` / `suffix`. When enabled, every vendor model gets a vendor prefix/suffix in its public ID (e.g. `zcodeglobal-GLM-5.3`) so same-name models can be pinned to a channel; tags are per-vendor, not per-account. Once tagged, same-name models are no longer merged across vendors. Takes effect after the host rebuilds its model registry (restart or credential reload; the console shows a restart-pending hint) |
 | `disabled_models` | string / list | empty | Disabled models (`vendor:model` or bare name) |
 | `extra_models` | string | empty | Additional model IDs to register (comma-separated) |
-| `state_dir` | string | `~/.freetier2api-plugin` | State and cache directory |
+| `state_dir` | string | `~/.freetier-plugin` | State and cache directory |
 | `log_level` | string | `info` | Log level: `debug` / `info` / `error` |
+| `log_to_file` | bool | `false` | Also write logs to `<state_dir>/logs/`, one file per day |
+| `log_to_host` | bool | `true` | Mirror plugin logs into the host `main.log` so they show up in the CLIProxyAPI panel log page |
+| `host_log_file` | string | auto-detect | Host log path. Empty means derive `<base>/auths/logs/main.log` or `<base>/logs/main.log` from `state_dir`; disabled when neither exists |
+| `host_log_level` | string | `info` | Minimum level mirrored to the host log: `debug` / `info` / `error` |
 
 ## Project Architecture
 
@@ -211,13 +182,6 @@ This project references or adapts protocol designs, ABI contracts, and metadata 
 ## Contributing
 
 Friendly discussion is welcome. If you run into issues, try asking Claude Code, Codex, or similar tools for help first — most problems can be solved that way. PRs are even better.
-
-## Disclaimer
-
-1. **Personal & Educational Use Only**: This project is provided strictly for personal learning, technical research, and protocol interoperability testing. Commercial sale, API resale, paid hosting, automated reward farming, public shared pools, or any illegal use is strictly prohibited.
-2. **Non-Affiliation**: This project is an independent open-source work and is not affiliated with, endorsed by, or sponsored by Tencent (WorkBuddy / CodeBuddy), Alibaba (Qoder), Zhipu / Z.AI (ZCode), ByteDance (Trae), Huawei Cloud (CodeArts), MiniMax, Cline, OpenCode, or any other upstream provider.
-3. **Compliance & Assumption of Risk**: Accessing services via unofficial clients or using automated check-in/task features may violate the Terms of Service (ToS) of upstream platforms and may result in account suspension, quota revocation, or other legal/compliance consequences. Users are solely responsible for ensuring their usage complies with all applicable Terms of Service and laws. The authors and contributors assume no liability for any direct or indirect damages arising from the use of this software.
-4. **Takedown Contact**: If any upstream provider or rights holder believes any part of this repository infringes upon your legitimate rights, please open an Issue and the relevant adapter code will be promptly removed.
 
 ## License
 

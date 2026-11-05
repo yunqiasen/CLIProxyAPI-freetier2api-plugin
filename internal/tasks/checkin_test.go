@@ -2,6 +2,7 @@ package tasks
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/state"
 )
 
@@ -21,17 +23,19 @@ import (
 
 // fakeDeps 是只实现落库所需能力的最小 Deps。
 type fakeDeps struct {
-	now   time.Time
-	state state.State
-	cfg   Config
+	pool     *auth.Pool
+	registry *core.Registry
+	now      time.Time
+	state    state.State
+	cfg      Config
 	// mutations 统计落盘次数：一次签到只应产生一次状态变更。
 	mutations int
 	// refreshSaves 统计凭证写回次数：并发续期只应写回一次。
 	refreshSaves int
 }
 
-func (f *fakeDeps) Registry() *core.Registry { return nil }
-func (f *fakeDeps) Pool() *auth.Pool         { return nil }
+func (f *fakeDeps) Registry() *core.Registry { return f.registry }
+func (f *fakeDeps) Pool() *auth.Pool         { return f.pool }
 func (f *fakeDeps) Config() Config           { return f.cfg }
 func (f *fakeDeps) State() state.State       { return f.state }
 func (f *fakeDeps) Now() time.Time           { return f.now }
@@ -227,12 +231,12 @@ func TestCheckinRecordsHistoryForEveryPath(t *testing.T) {
 	})
 }
 
-// TestCheckinHistoryTrimsOldest 验证超出上限时淘汰最旧，且始终新→旧。
-func TestCheckinHistoryTrimsOldest(t *testing.T) {
+// TestCheckinHistoryKeepsOnlyToday 验证历史只保留当天：同日不限条数，
+// 跨天（按签到时区判断）一律丢弃旧记录。
+func TestCheckinHistoryKeepsOnlyToday(t *testing.T) {
 	credential := &core.Credential{FileID: "qodercn-user"}
 	key := state.CheckinHistoryKey("qodercn", "qodercn-user")
 	deps := newFakeDeps(time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC))
-	deps.cfg.CheckinHistoryLimit = 2
 	service := &Service{deps: deps}
 
 	for index := 1; index <= 3; index++ {
@@ -244,11 +248,59 @@ func TestCheckinHistoryTrimsOldest(t *testing.T) {
 	}
 
 	history := deps.state.CheckinHistory[key]
-	if len(history) != 2 {
-		t.Fatalf("历史条数 = %d, 期望按上限截断到 2", len(history))
+	if len(history) != 3 {
+		t.Fatalf("同一天的历史条数 = %d, 期望 3（不再按条数截断）", len(history))
 	}
-	if history[0].Message != "第 3 次" || history[1].Message != "第 2 次" {
-		t.Fatalf("历史顺序 = %+v, 期望新→旧且淘汰最旧", history)
+	if history[0].Message != "第 3 次" || history[2].Message != "第 1 次" {
+		t.Fatalf("历史顺序 = %+v, 期望新→旧", history)
+	}
+
+	// 跨天：新一天的第一条写下时，前一天的三条全部淘汰。
+	deps.now = time.Date(2026, 10, 26, 9, 30, 0, 0, time.UTC)
+	vendor := &fakeCheckinVendor{id: "qodercn", result: &core.CheckinResult{Message: "次日"}}
+	if _, errRun := service.Checkin(context.Background(), vendor, credential, CheckinTriggerManual); errRun != nil {
+		t.Fatalf("Checkin: %v", errRun)
+	}
+	history = deps.state.CheckinHistory[key]
+	if len(history) != 1 || history[0].Message != "次日" {
+		t.Fatalf("跨天后历史 = %+v, 期望只剩当天一条", history)
+	}
+}
+
+// TestPruneCheckinHistoryOnStart 验证启动清理：跨天残留被删、当天记录保留、
+// 全是旧记录时整个键被移除。
+func TestPruneCheckinHistoryOnStart(t *testing.T) {
+	deps := newFakeDeps(time.Date(2026, 10, 25, 8, 0, 0, 0, time.UTC))
+	old := state.CheckinHistoryKey("qodercn", "old-user")
+	sameDay := state.CheckinHistoryKey("qodercn", "same-day")
+	stale := state.CheckinHistoryKey("qodercn", "stale-user")
+	deps.state.CheckinHistory[old] = []state.CheckinHistoryEntry{
+		{RunAt: "2026-10-24T09:00:00+08:00", Status: "ok", Message: "昨天"},
+	}
+	deps.state.CheckinHistory[sameDay] = []state.CheckinHistoryEntry{
+		{RunAt: "2026-10-25T09:00:00+08:00", Status: "ok", Message: "今天"},
+		{RunAt: "2026-10-24T09:00:00+08:00", Status: "ok", Message: "昨天"},
+	}
+	deps.state.CheckinHistory[stale] = []state.CheckinHistoryEntry{
+		{RunAt: "not-a-time", Status: "ok", Message: "解析不了"},
+	}
+	service := &Service{deps: deps}
+
+	if dropped := service.pruneCheckinHistory(); dropped != 3 {
+		t.Fatalf("丢弃条数 = %d, 期望 3", dropped)
+	}
+	if _, ok := deps.state.CheckinHistory[old]; ok {
+		t.Error("全是旧记录的键必须整条移除")
+	}
+	if _, ok := deps.state.CheckinHistory[stale]; ok {
+		t.Error("时间解析失败的记录无法证明属于当天，必须丢弃")
+	}
+	kept := deps.state.CheckinHistory[sameDay]
+	if len(kept) != 1 || kept[0].Message != "今天" {
+		t.Fatalf("当天记录 = %+v, 期望只留「今天」", kept)
+	}
+	if dropped := service.pruneCheckinHistory(); dropped != 0 {
+		t.Fatalf("第二次清理丢弃 %d 条, 期望 0（幂等）", dropped)
 	}
 }
 
@@ -305,5 +357,93 @@ func TestRecordCheckinResultPersistsStreak(t *testing.T) {
 	})
 	if got := deps.state.Checkin[credential.FileIDValue()].Streak; got != 8 {
 		t.Errorf("连签天数 = %d, 期望 8", got)
+	}
+}
+
+// refreshableCheckinVendor 支持 Checkin 与 Refresh 的测试 Vendor。
+type refreshableCheckinVendor struct {
+	fakeCheckinVendor
+	checkinCount int
+	refreshed    bool
+}
+
+func (v *refreshableCheckinVendor) Checkin(ctx context.Context, cred *core.Credential) (*core.CheckinResult, error) {
+	v.checkinCount++
+	if cred.TokenValue() == "expired-token" {
+		return nil, &core.Failure{
+			Kind:   core.FailureKindCredential,
+			Status: 401,
+			Code:   "APIG.0602",
+			Msg:    "Bad request: the security token has expired",
+		}
+	}
+	return &core.CheckinResult{Credit: 1000, Message: "签到成功 +1000 积分"}, nil
+}
+
+func (v *refreshableCheckinVendor) Refresh(ctx context.Context, cred *core.Credential) (*core.Credential, bool, error) {
+	v.refreshed = true
+	cred.ApplyTokenRefresh("fresh-token", "new-rt", time.Now().Add(12*time.Hour).Unix())
+	return cred, true, nil
+}
+
+// TestCheckinAutoRefreshesOn401 验证：当 Checkin 遇到 401 凭证过期时，
+// 任务服务会自动通过 RefreshAccount 刷新凭据并落盘写回，重试完成签到。
+func TestCheckinAutoRefreshesOn401(t *testing.T) {
+	vendor := &refreshableCheckinVendor{fakeCheckinVendor: fakeCheckinVendor{id: "testvendor"}}
+	reg := core.NewRegistry()
+	reg.Register(vendor)
+
+	cred := &core.Credential{
+		VendorID: "testvendor",
+		FileID:   "user1",
+		Token:    "expired-token",
+		UID:      "user1",
+	}
+
+	pool := auth.NewPool(reg, func(ctx context.Context, callbackID string, storageJSON []byte, authID string, attrs map[string]string) (*core.Credential, core.Vendor, error) {
+		return cred, vendor, nil
+	})
+
+	// mock hostbridge 列表
+	hostbridge.Configure(func(_ string, method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case "host.auth.list":
+			return json.Marshal([]map[string]any{
+				{"id": "user1", "name": "user1.json", "auth_index": "user1.json", "provider": "freetier"},
+			})
+		case "host.auth.get":
+			return json.Marshal(map[string]any{
+				"auth_index": "user1.json",
+				"name":       "user1.json",
+				"json":       []byte(`{"token":"expired-token"}`),
+			})
+		}
+		return nil, fmt.Errorf("unexpected method: %s", method)
+	})
+	t.Cleanup(func() { hostbridge.Configure(nil) })
+
+	deps := newFakeDeps(time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC))
+	deps.pool = pool
+	deps.registry = reg
+	service := New(deps)
+
+	result, err := service.Checkin(context.Background(), vendor, cred, CheckinTriggerSchedule)
+	if err != nil {
+		t.Fatalf("Checkin failed: %v", err)
+	}
+	if result == nil || result.Credit != 1000 {
+		t.Fatalf("unexpected checkin result: %+v", result)
+	}
+	if vendor.checkinCount != 2 {
+		t.Errorf("checkinCount = %d, want 2 (initial 401 + retry)", vendor.checkinCount)
+	}
+	if !vendor.refreshed {
+		t.Error("expected vendor to be refreshed")
+	}
+	if cred.TokenValue() != "fresh-token" {
+		t.Errorf("expected token to be updated, got %q", cred.TokenValue())
+	}
+	if deps.refreshSaves != 1 {
+		t.Errorf("refreshSaves = %d, want 1", deps.refreshSaves)
 	}
 }

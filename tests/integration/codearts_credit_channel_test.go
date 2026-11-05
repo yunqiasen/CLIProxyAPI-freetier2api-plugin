@@ -109,7 +109,10 @@ func TestCodeArtsCreditChannelRequiresExplicitOptIn(t *testing.T) {
 
 func TestCodeArtsCreditCatalogUsesOnlyBuiltinModels(t *testing.T) {
 	host := installFakeHost(t)
-	setupTestPlugin(t, func(cfg *app.Config) { cfg.Raw = map[string]string{"codearts_credit_enabled": "true"} })
+	setupTestPlugin(t, func(cfg *app.Config) {
+		cfg.Raw = map[string]string{"codearts_credit_enabled": "true"}
+		cfg.ModelNameTag = "prefix"
+	})
 	host.addAccount("1", "codearts-user-1.json", codeartsCredentialJSON)
 	var benefitCalls atomic.Int32
 	host.setUpstream(func(method, url, body string) fakeUpstreamResponse {
@@ -135,7 +138,7 @@ func TestCodeArtsCreditCatalogUsesOnlyBuiltinModels(t *testing.T) {
 			t.Fatal(err)
 		}
 		ids := modelIDSet(t, response.Models)
-		if len(ids) != 1 || !ids["deepseek-v4.1-flash-1017"] {
+		if len(ids) != 1 || !ids["codearts-deepseek-v4.1-flash-1017"] {
 			t.Fatalf("credit catalog must not contain guessed or benefit-only models: %v", ids)
 		}
 	}

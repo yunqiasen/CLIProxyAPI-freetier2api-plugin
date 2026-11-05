@@ -1379,6 +1379,37 @@ func mergeTasks(primary, extra []Task) []Task {
 // ---- 任务执行 ----
 
 func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code string) (core.TaskRunResult, error) {
+	trimmed := strings.TrimSpace(code)
+	if trimmed == core.AutoTaskCodeCheckin {
+		row := core.CheckinAutoTask(ctx, v, cred)
+		if row == nil {
+			return core.TaskRunResult{Status: "skipped", Message: "该账号不支持签到"}, nil
+		}
+		return core.TaskRunResult{Status: row.Status, Message: row.Message}, nil
+	}
+	// 活动族：与一键任务里那几行走同一套 RunScheduled。
+	for _, family := range []struct {
+		code string
+		kind string
+	}{
+		{AutoTaskCodeTravel, TaskKindTravel},
+		{AutoTaskCodeActivity, TaskKindActivity},
+		{AutoTaskCodeBlackcat, TaskKindBlackcat},
+		{AutoTaskCodeSchool, TaskKindSchool},
+		{AutoTaskCodeStreak, TaskKindStreak},
+	} {
+		if trimmed != family.code {
+			continue
+		}
+		message, errFamily := v.RunScheduled(ctx, cred, family.kind)
+		if errFamily != nil {
+			return core.TaskRunResult{}, errFamily
+		}
+		if message == "" {
+			return core.TaskRunResult{Status: "skipped", Message: "当前无需动作（不在窗口或已完成）"}, nil
+		}
+		return core.TaskRunResult{Status: "done", Message: message}, nil
+	}
 	if v.region.IsGlobal() {
 		return core.TaskRunResult{Status: "skipped", Message: "国际版账号没有成长任务"}, nil
 	}
@@ -1387,7 +1418,7 @@ func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code strin
 		return core.TaskRunResult{}, err
 	}
 	client := v.client(ctx)
-	if strings.TrimSpace(code) == "school_daily" {
+	if trimmed == "school_daily" {
 		message, errRun := RunSchool(ctx, client, native)
 		if errRun != nil {
 			return core.TaskRunResult{}, errRun
@@ -1416,16 +1447,31 @@ func (v *adapter) PrepareTasks(ctx context.Context, cred *core.Credential) int {
 	return acceptPendingTasks(ctx, v.client(ctx), native)
 }
 
+// 一键任务里代表各活动族的那一行任务码。它们与定时排程的 kind 一一对应，
+// 复用 RunScheduled 的实现，避免两套逻辑各自漂移。
+const (
+	AutoTaskCodeTravel   = "(猫猫旅行)"
+	AutoTaskCodeActivity = "(活跃上报)"
+	AutoTaskCodeBlackcat = "(夜猫子)"
+	AutoTaskCodeSchool   = "(开学季)"
+	AutoTaskCodeStreak   = "(连登奖励)"
+)
+
 func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core.AutoTaskResult {
-	if v.region.IsGlobal() {
-		return nil
+	results := make([]core.AutoTaskResult, 0, len(autoActions)+7)
+	if row := core.CheckinAutoTask(ctx, v, cred); row != nil {
+		results = append(results, *row)
 	}
 	native, err := v.Native(cred)
 	if err != nil {
-		return []core.AutoTaskResult{{Code: "(账号)", Status: "error", Message: err.Error()}}
+		return append(results, core.AutoTaskResult{Code: "(账号)", Status: "error", Message: err.Error()})
 	}
 	client := v.client(ctx)
-	results := make([]core.AutoTaskResult, 0, len(autoActions)+1)
+	if v.region.IsGlobal() {
+		// 国际版没有成长任务体系：可自动领取的福利只有每日活跃奖励，
+		// 已由上面的签到行覆盖，这里不再补空行。
+		return results
+	}
 	if accepted := acceptPendingTasks(ctx, client, native); accepted > 0 {
 		results = append(results, core.AutoTaskResult{
 			Code: "(批量报名)", Status: "done",
@@ -1468,6 +1514,29 @@ func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core
 		}
 		results = append(results, result)
 		core.SleepContext(ctx, 1050*time.Millisecond)
+	}
+	// 成长任务之外的活动福利：猫猫旅行、活跃/连登上报、夜猫子、开学季、
+	// 连登奖励。它们原本只在定时排程里跑，一键任务里缺一块，用户点了
+	// 「一键做任务」也拿不到这部分奖励。
+	for _, family := range []struct {
+		code string
+		kind string
+	}{
+		{AutoTaskCodeTravel, TaskKindTravel},
+		{AutoTaskCodeActivity, TaskKindActivity},
+		{AutoTaskCodeBlackcat, TaskKindBlackcat},
+		{AutoTaskCodeSchool, TaskKindSchool},
+		{AutoTaskCodeStreak, TaskKindStreak},
+	} {
+		message, errFamily := v.RunScheduled(ctx, cred, family.kind)
+		switch {
+		case errFamily != nil:
+			results = append(results, core.AutoTaskResult{Code: family.code, Status: "error", Message: errFamily.Error()})
+		case message == "":
+			// 空消息表示本次无需动作（不在窗口 / 活动期外），不占一行。
+		default:
+			results = append(results, core.AutoTaskResult{Code: family.code, Status: "done", Message: message})
+		}
 	}
 	return results
 }
@@ -1517,19 +1586,27 @@ func waitGrowthClaimable(ctx context.Context, client *Client, credential *Creden
 	if mp {
 		attempts = 2
 	}
-	for attempt := 1; attempt < attempts; attempt++ {
+	for attempt := 1; attempt <= attempts; attempt++ {
+		// 先查后等：任务刚创建时多数已经可领，无脑先睡 3 秒纯属白等，
+		// 每个任务白白多花 3~9 秒。
+		task, errTask := findGrowthTask(ctx, client, credential, code)
+		if errTask == nil {
+			// 已领过是终态，不必再等。
+			if task != nil && task.Claimed {
+				return false
+			}
+			if task != nil && (task.Claimable() || task.Done()) {
+				return true
+			}
+			// task == nil 不能当终态：动作刚做完时上游列表还没把该任务吐出来
+			// （列表最终一致），此刻放弃等于白做任务、拿不到奖励。宁可多等
+			// 一轮——只有 attempts 用尽才判失败。
+		}
+		if attempt == attempts {
+			break
+		}
 		if !core.SleepContext(ctx, 3*time.Second) {
 			return false
-		}
-		task, errTask := findGrowthTask(ctx, client, credential, code)
-		if errTask != nil {
-			continue
-		}
-		if task == nil || task.Claimed {
-			return false
-		}
-		if task.Claimable() || task.Done() {
-			return true
 		}
 	}
 	return false
@@ -1563,14 +1640,14 @@ func claimGrowthReward(ctx context.Context, client *Client, credential *Credenti
 	if IsMPTaskCode(code) {
 		credit, energy, errClaim := client.ClaimRewardMP(ctx, credential, code)
 		if errClaim != nil {
-			logger.Debug("claim mp reward for %s failed: %v", code, errClaim)
+			logger.Debug("%s 领取 MP 奖励失败：%v", code, errClaim)
 			return 0, 0, errClaim
 		}
 		return credit, energy, nil
 	}
 	credit, energy, errClaim := client.ClaimReward(ctx, credential, code)
 	if errClaim != nil {
-		logger.Debug("claim reward for %s failed: %v", code, errClaim)
+		logger.Debug("%s 领取奖励失败：%v", code, errClaim)
 		return 0, 0, errClaim
 	}
 	return credit, energy, nil
@@ -1675,7 +1752,7 @@ func (v *adapter) RunScheduled(ctx context.Context, cred *core.Credential, kind 
 		}
 		return checkActivityStreak(ctx, client, native), nil
 	case TaskKindTravel:
-		return RunTravel(ctx, client, native), nil
+		return RunTravel(ctx, client, native)
 	case TaskKindBlackcat:
 		if !InNightWindow(time.Now()) {
 			return "", nil
@@ -1695,7 +1772,7 @@ func checkActivityStreak(ctx context.Context, client *Client, credential *Creden
 		return ""
 	}
 	if streak.Days == 0 {
-		logger.Error("activity: report succeeded but streak.days=0 (event may have been silently dropped)")
+		logger.Error("活动：上报成功但连续天数为 0（事件可能被上游静默丢弃）")
 		return ""
 	}
 	return fmt.Sprintf("连登天数 %d", streak.Days)
@@ -1717,7 +1794,7 @@ func runChatFive(ctx context.Context, client *Client, credential *Credential) (s
 }
 
 func runFirstBuddy(ctx context.Context, client *Client, credential *Credential) (string, error) {
-	return RunTravel(ctx, client, credential), nil
+	return RunTravel(ctx, client, credential)
 }
 
 func runModelChat(ctx context.Context, client *Client, credential *Credential) (string, error) {
@@ -1840,7 +1917,7 @@ func runExpertChain(ctx context.Context, client *Client, credential *Credential,
 		}
 		requestID, errChat := client.DesktopChatWithRequestID(ctx, credential, expert.ID, "fast-model", conversationID)
 		if errChat != nil {
-			logger.Debug("expert chat failed for %s: %v", expert.ID, errChat)
+			logger.Debug("%s 专家对话失败：%v", expert.ID, errChat)
 			continue
 		}
 		if errReport := client.ReportDesktopEvents(ctx, credential,
@@ -2225,40 +2302,40 @@ func makeupYesterday(ctx context.Context, client *Client, credential *Credential
 // RunTravel 执行单账号猫猫旅行的一个动作。
 //
 // 状态机：无猫 → 领养；有猫 → 按 status 分派（idle 派出 / arrived 领奖 / traveling 跳过）。
-func RunTravel(ctx context.Context, client *Client, credential *Credential) string {
+func RunTravel(ctx context.Context, client *Client, credential *Credential) (string, error) {
 	info, errInfo := client.BuddyInfo(ctx, credential)
 	if errInfo != nil {
-		return ""
+		return "", errInfo
 	}
 	if !info.HasBuddy {
-		return adoptBuddy(ctx, client, credential)
+		return adoptBuddy(ctx, client, credential), nil
 	}
 
 	status, errStatus := client.TravelStatus(ctx, credential)
 	if errStatus != nil {
-		return ""
+		return "", errStatus
 	}
 	switch status.State {
 	case "arrived":
 		if status.RecordID <= 0 {
-			return ""
+			return "", nil
 		}
 		credit, errClaim := client.TravelClaim(ctx, credential, status.RecordID)
 		if errClaim != nil {
-			return ""
+			return "", errClaim
 		}
-		return fmt.Sprintf("旅行领奖 +%d", credit)
+		return fmt.Sprintf("旅行领奖 +%d", credit), nil
 	case "idle":
 		if status.DailyLimitReached {
-			return ""
+			return "", nil
 		}
 		if errDepart := client.TravelDepart(ctx, credential, travelLocationID); errDepart != nil {
-			return ""
+			return "", errDepart
 		}
-		return "派出旅行"
+		return "派出旅行", nil
 	default:
 		// traveling 或未知状态：本轮不做动作。
-		return ""
+		return "", nil
 	}
 }
 
@@ -2306,13 +2383,14 @@ func RunBlackcat(ctx context.Context, client *Client, credential *Credential) (s
 		return "", nil
 	}
 	completed := int64(0)
+	var errChat error
 	for index := int64(0); index < need; index++ {
 		conversationID := fmt.Sprintf("wb2api-night-%d-%d", nowUnixMs(), index)
 		// 真实对话：上游要求夜猫子判据是「窗口内的真实 glm-5.2 对话」。
-		if errChat := client.DesktopChat(ctx, credential, "", "glm-5.2", "GLM-5.2", conversationID); errChat != nil {
+		if errChat = client.DesktopChat(ctx, credential, "", "glm-5.2", "GLM-5.2", conversationID); errChat != nil {
 			break
 		}
-		if errReport := client.ReportChatActivity(ctx, credential, conversationID, "", "glm-5.2", "GLM-5.2"); errReport != nil {
+		if errChat = client.ReportChatActivity(ctx, credential, conversationID, "", "glm-5.2", "GLM-5.2"); errChat != nil {
 			break
 		}
 		completed++
@@ -2321,7 +2399,9 @@ func RunBlackcat(ctx context.Context, client *Client, credential *Credential) (s
 		}
 	}
 	if completed == 0 {
-		return "", nil
+		// 一次都没跑成要把错误交回去：折成空字符串会让上层显示「0 个账号」，
+		// 看起来像无事可做，实际是上游拒了。
+		return "", errChat
 	}
 	return fmt.Sprintf("夜间对话 %d 次", completed), nil
 }
@@ -2346,6 +2426,9 @@ func RunSchool(ctx context.Context, client *Client, credential *Credential) (str
 	}
 
 	completed := 0
+	// 逐任务失败不再静默 continue：一次都没跑成时必须把原因交回上层，
+	// 否则排程日志只显示「0 个账号」，看不出是活动没开还是被上游拒了。
+	var errFirst error
 	for _, task := range status.Tasks {
 		switch task.Code {
 		case "task_student_verify":
@@ -2357,9 +2440,15 @@ func RunSchool(ctx context.Context, client *Client, credential *Credential) (str
 		}
 		// viewed 是计数前置：未激活的任务，后续行为事件不计分。
 		if errView := client.SchoolTaskViewed(ctx, credential, task.Code); errView != nil {
+			if errFirst == nil {
+				errFirst = fmt.Errorf("%s: %w", task.Code, errView)
+			}
 			continue
 		}
 		if errRun := runSchoolTask(ctx, client, credential, task.Code); errRun != nil {
+			if errFirst == nil {
+				errFirst = fmt.Errorf("%s: %w", task.Code, errRun)
+			}
 			continue
 		}
 		// 等异步计分落定再领奖。
@@ -2367,6 +2456,9 @@ func RunSchool(ctx context.Context, client *Client, credential *Credential) (str
 			continue
 		}
 		if _, errClaim := client.SchoolTaskClaim(ctx, credential, task.Code); errClaim != nil {
+			if errFirst == nil {
+				errFirst = fmt.Errorf("%s: %w", task.Code, errClaim)
+			}
 			continue
 		}
 		completed++
@@ -2386,7 +2478,7 @@ func RunSchool(ctx context.Context, client *Client, credential *Credential) (str
 		}
 	}
 	if completed == 0 && drawn == 0 {
-		return "", nil
+		return "", errFirst
 	}
 	return fmt.Sprintf("完成 %d 个任务、抽奖 %d 次", completed, drawn), nil
 }
@@ -2574,7 +2666,7 @@ func (c *Client) DailyCheckin(cred *Credential) (*CheckinResult, error) {
 		// 真实到账的签到报成失败，否则用户会重复点、历史里也记成 error。
 		if len(data) > 0 {
 			if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
-				logger.Debug("workbuddy: 签到回执解析失败，按成功处理: %v", errUnmarshal)
+				logger.Debug("workbuddy：签到回执解析失败，按成功处理：%v", errUnmarshal)
 			}
 		}
 		return &CheckinResult{
@@ -2953,27 +3045,59 @@ func BuildQuotaResponse(credential *Credential, balance *Balance) pluginapi.Quot
 			pluginapi.QuotaMetric{Key: "credit_used", Label: "已用积分", Value: used, Format: "number"})
 	}
 	if len(balance.Packages) > 0 {
-		buckets := make([]pluginapi.QuotaBucket, 0, len(balance.Packages))
+		// 同名包先合并：营销活动会下发一串同名的「裂变包」，每个 100/100，
+		// 不合并就是五条 100% 进度条，把真正在消耗的套餐挤到看不见。
+		// 合并按首次出现顺序，周期/到期时间取第一个非空值。
+		type packageAggregate struct {
+			remain   float64
+			total    float64
+			period   string
+			expireAt int64
+			resetAt  int64
+		}
+		order := make([]string, 0, len(balance.Packages))
+		merged := make(map[string]*packageAggregate, len(balance.Packages))
 		for _, pkg := range balance.Packages {
-			fraction := 0.0
-			if pkg.Total > 0 {
-				fraction = pkg.Remain / pkg.Total
+			agg, ok := merged[pkg.Name]
+			if !ok {
+				agg = &packageAggregate{}
+				merged[pkg.Name] = agg
+				order = append(order, pkg.Name)
 			}
-			description := formatCreditAmount(pkg.Remain) + " / " + formatCreditAmount(pkg.Total)
-			if pkg.Period != "" {
-				description += " · 周期 " + pkg.Period
+			agg.remain += pkg.Remain
+			agg.total += pkg.Total
+			if agg.period == "" {
+				agg.period = pkg.Period
+			}
+			if agg.expireAt == 0 {
+				agg.expireAt = pkg.ExpireAt
+			}
+			if agg.resetAt == 0 {
+				agg.resetAt = pkg.ResetAt
+			}
+		}
+		buckets := make([]pluginapi.QuotaBucket, 0, len(order))
+		for _, name := range order {
+			agg := merged[name]
+			fraction := 0.0
+			if agg.total > 0 {
+				fraction = agg.remain / agg.total
+			}
+			description := formatCreditAmount(agg.remain) + " / " + formatCreditAmount(agg.total)
+			if agg.period != "" {
+				description += " · 周期 " + agg.period
 			}
 			bucket := pluginapi.QuotaBucket{
-				Window:            pkg.Name,
+				Window:            name,
 				RemainingFraction: fraction,
 				Description:       description,
 			}
 			// 到期（作废）与回满（周期重置）分开取值：企业额度到点回满，
 			// 不能被展示成「即将过期」。
-			if pkg.ExpireAt > 0 {
-				bucket.ResetTime = FormatUnixTime(pkg.ExpireAt)
-			} else if pkg.ResetAt > 0 {
-				bucket.ResetTime = FormatUnixTime(pkg.ResetAt)
+			if agg.expireAt > 0 {
+				bucket.ResetTime = FormatUnixTime(agg.expireAt)
+			} else if agg.resetAt > 0 {
+				bucket.ResetTime = FormatUnixTime(agg.resetAt)
 			}
 			buckets = append(buckets, bucket)
 		}

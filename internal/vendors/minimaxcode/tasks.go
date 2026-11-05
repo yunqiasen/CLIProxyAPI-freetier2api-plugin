@@ -249,20 +249,21 @@ func opSummaryMetrics(coreMap map[string]any) []pluginapi.QuotaMetric {
 		}
 	}
 
+	// Unit 留空：面板把 unit 直接拼在数字后，填「点」会渲染成「1,200 点」，
+	// 与其它渠道的裸数字不齐。计量单位由 Label 承担。
 	metrics := []pluginapi.QuotaMetric{{
 		Key:   "remaining",
 		Label: "总剩余额度",
 		Value: totalRemaining,
-		Unit:  "点",
 	}}
 	if freeRemaining > 0 {
 		metrics = append(metrics, pluginapi.QuotaMetric{
-			Key: "free", Label: "免费额度", Value: freeRemaining, Unit: "点",
+			Key: "free", Label: "免费额度", Value: freeRemaining,
 		})
 	}
 	if purchasedRemaining > 0 {
 		metrics = append(metrics, pluginapi.QuotaMetric{
-			Key: "purchased", Label: "付费额度", Value: purchasedRemaining, Unit: "点",
+			Key: "purchased", Label: "付费额度", Value: purchasedRemaining,
 		})
 	}
 	return metrics
@@ -308,7 +309,6 @@ func extractTokenPlanHead(coreMap map[string]any) *tokenPlanHead {
 			Key:   "token_remaining",
 			Label: "Token Plan 剩余",
 			Value: remains,
-			Unit:  "tokens",
 		})
 	}
 	return info
@@ -346,17 +346,17 @@ func fetchTokenPlanRemains(ctx context.Context, cred *Credential, groupID string
 	}
 	resp, errDo := hostbridge.Client(ctx, 10*time.Second).Do(req)
 	if errDo != nil {
-		logger.Debug("minimax token plan windows: request failed: %v", errDo)
+		logger.Debug("minimax 令牌套餐窗口：请求失败：%v", errDo)
 		return nil
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		logger.Debug("minimax token plan windows: endpoint returned %s", resp.Status)
+		logger.Debug("minimax 令牌套餐窗口：端点返回 %s", resp.Status)
 		return nil
 	}
 	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if errRead != nil {
-		logger.Debug("minimax token plan windows: read failed: %v", errRead)
+		logger.Debug("minimax 令牌套餐窗口：读取失败：%v", errRead)
 		return nil
 	}
 	return parseTokenPlanRemains(raw)
@@ -366,7 +366,7 @@ func fetchTokenPlanRemains(ctx context.Context, cred *Credential, groupID string
 func parseTokenPlanRemains(raw []byte) []pluginapi.QuotaGroup {
 	var body map[string]any
 	if errDecode := json.Unmarshal(raw, &body); errDecode != nil {
-		logger.Debug("minimax token plan windows: decode failed: %v", errDecode)
+		logger.Debug("minimax 令牌套餐窗口：解析失败：%v", errDecode)
 		return nil
 	}
 	rows, _ := body["model_remains"].([]any)

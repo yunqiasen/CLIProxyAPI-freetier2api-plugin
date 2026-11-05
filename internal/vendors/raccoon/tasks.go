@@ -27,6 +27,10 @@ import (
 // apiHTTPTimeout 是 JSON API 请求的上限。
 const apiHTTPTimeout = 30 * time.Second
 
+// TaskKindDailyGrant 是小浣熊「每日积分」任务族（core 常量，见
+// core.TaskKindRaccoonDailyGrant）。这里保留别名便于供应商内部引用。
+const TaskKindDailyGrant = core.TaskKindRaccoonDailyGrant
+
 // ErrCheckinNotGranted 表示登录领取时上游返回 granted:false（该账号已领过）。
 var ErrCheckinNotGranted = errors.New("该账号已领取过桌面端登录奖励（每号一次）")
 
@@ -76,6 +80,62 @@ func ClaimDailyGrant(ctx context.Context, origin string, cred *Credential) (gran
 		credit = data.Popup.Points
 	}
 	return true, credit, nil
+}
+
+// DailyGrantViaSetting 触发每日积分发放（GET {origin}/api/web/office/v3/setting_info）。
+//
+// 上游在读取 setting_info 时发放当日每日积分（若当天未发），并把它放进
+// 响应 data.point_grant_popups（source=daily 即每日积分）。网页端专属：只有
+// x-client-platform=web 才触发，桌面端的 desktop-windows-x64 不触发。
+// 幂等：当天已发时不再新增发放，返回 granted=false。
+//
+// 组织账号走 {origin}/api/web/office/v3/office/<org>/setting_info 并带
+// X-Org-Code，个人账号走 {origin}/api/web/office/v3/setting_info（与网页端
+// getUserSettingInfo 的路径分支一致）。
+func DailyGrantViaSetting(ctx context.Context, origin string, cred *Credential) (granted bool, credit int64, err error) {
+	if strings.TrimSpace(origin) == "" {
+		return false, 0, fmt.Errorf("upstream origin is not configured")
+	}
+	endpoint := strings.TrimRight(origin, "/") + OfficeBasePath
+	if org := strings.TrimSpace(cred.OfficeIdentityValue()); org != "" {
+		endpoint += "/office/" + org
+	}
+	endpoint += SettingInfoPath
+	req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if errReq != nil {
+		return false, 0, fmt.Errorf("build setting_info request: %w", errReq)
+	}
+	ApplyWebHeaders(req, cred.AccessTokenValue(), cred.OfficeIdentityValue())
+
+	resp, errDo := hostbridge.Client(ctx, apiHTTPTimeout).Do(req)
+	if errDo != nil {
+		return false, 0, &core.Failure{Msg: "setting_info: " + errDo.Error(), Kind: core.FailureKindTransient}
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if errRead != nil {
+		return false, 0, &core.Failure{Status: resp.StatusCode, Msg: "read setting_info response: " + errRead.Error(), Kind: core.FailureKindTransient}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false, 0, Classify(resp.StatusCode, string(raw))
+	}
+	data, errDecode := decodeAPIData[struct {
+		PointGrantPopups []struct {
+			Source string `json:"source"`
+			Points int64  `json:"points"`
+		} `json:"point_grant_popups"`
+	}](resp.StatusCode, raw, "setting_info")
+	if errDecode != nil {
+		return false, 0, errDecode
+	}
+	for _, popup := range data.PointGrantPopups {
+		if strings.EqualFold(strings.TrimSpace(popup.Source), "daily") {
+			granted = true
+			credit += popup.Points
+		}
+	}
+	return granted, credit, nil
 }
 func decodeAPIData[T any](status int, raw []byte, what string) (T, error) {
 	var zero T

@@ -36,7 +36,7 @@ const (
 
 // runTaskScheduler 是后台调度循环。
 func (s *Service) runTaskScheduler(ctx context.Context) {
-	logger.Info("task scheduler started")
+	logger.Info("任务调度已启动")
 	s.schedulerMu.Lock()
 	s.running = true
 	s.schedulerMu.Unlock()
@@ -44,7 +44,7 @@ func (s *Service) runTaskScheduler(ctx context.Context) {
 		s.schedulerMu.Lock()
 		s.running = false
 		s.schedulerMu.Unlock()
-		logger.Info("task scheduler stopped")
+		logger.Info("任务调度已停止")
 	}()
 	for {
 		kinds, next := s.nextScheduledWake(s.deps.Now())
@@ -56,12 +56,12 @@ func (s *Service) runTaskScheduler(ctx context.Context) {
 		case signal := <-s.pokeCh:
 			timer.Stop()
 			if signal == schedulerReconfigure {
-				logger.Debug("task scheduler reconfigured")
+				logger.Debug("任务调度已重新配置")
 			}
 			continue
 		case <-timer.C:
 			if delay := time.Since(next); delay > schedulerLateThreshold {
-				logger.Debug("task scheduler woke %s late, waiting grace period", delay.Round(time.Millisecond))
+				logger.Debug("任务调度晚醒 %s，进入宽限期等待", delay.Round(time.Millisecond))
 				if !core.SleepContext(ctx, schedulerWakeGrace) {
 					return
 				}
@@ -92,15 +92,21 @@ func (s *Service) nextScheduledWake(now time.Time) ([]string, time.Time) {
 // effectiveSchedule 返回生效的排程（页面设置优先于默认值）。
 func (s *Service) effectiveSchedule() map[string][]int {
 	schedule := s.catalog.EffectiveSchedule(s.deps.State().TaskSchedules)
-	// auto_checkin_at 是用户明确配置的签到时刻；未在任务排程里单独覆盖时
-	// 以它为准，否则页面上的设置永远不会生效（默认排程是 9/21 点）。
+	// auto_checkin_at 是用户明确配置的签到时刻，始终并入排程。
+	//
+	// 原先只在「任务排程里没有 checkin 覆盖」时才生效，但 task_schedules 在
+	// 首次启用任务时就会被写入默认值 [9,21]，于是页面上设置的 10:00 永远
+	// 被忽略——表现为「设了自动签到时间不生效」，Qoder 的 10:00 领取窗口
+	// 也永远跑空。这里改成并集：排程里的点保留作重试，设置里的点必定执行。
 	if s.effectiveAutoCheckin() {
-		if _, overridden := s.deps.State().TaskSchedules[core.TaskKindCheckin]; !overridden {
-			if hour, okHour := parseClockHour(s.checkinAt()); okHour {
-				// 保留默认排程点作为重试兜底：签到幂等，多跑一轮只多一次读。
-				schedule[core.TaskKindCheckin] = append([]int{hour}, schedule[core.TaskKindCheckin]...)
-			}
+		if hour, okHour := parseClockHour(s.checkinAt()); okHour {
+			schedule[core.TaskKindCheckin] = mergeHour(schedule[core.TaskKindCheckin], hour)
 		}
+	}
+	// 小浣熊「每日积分」按开关门控：关闭时从排程移除，不执行。
+	// kind 来自 core 常量（引擎层不能依赖供应商包）。
+	if !s.effectiveAutoRaccoonDailyGrant() {
+		delete(schedule, core.TaskKindRaccoonDailyGrant)
 	}
 	return schedule
 }
@@ -111,6 +117,14 @@ func (s *Service) checkinAt() string {
 		return at
 	}
 	return strings.TrimSpace(s.deps.Config().AutoCheckinAt)
+}
+
+// mergeHour 把一个整点并进排程小时列表，复用 NormalizeHours 做去重与排序。
+//
+// 这里曾自己写一份去重+排序，和 NormalizeHours 的规则分头演进（前者不校验
+// 0-23 边界、后者校验），并出来一条 24 点的排程不会被任何人发现。
+func mergeHour(hours []int, hour int) []int {
+	return NormalizeHours(append(hours, hour))
 }
 
 // parseClockHour 把 HH:MM 转成排程用的整点小时。
@@ -181,6 +195,16 @@ func (s *Service) effectiveAutoTasks() bool {
 	return s.deps.Config().AutoTasks
 }
 
+// effectiveAutoRaccoonDailyGrant 返回是否启用小浣熊「每日积分」任务
+// （页面设置优先于配置默认值）。
+func (s *Service) effectiveAutoRaccoonDailyGrant() bool {
+	state := s.deps.State()
+	if state.AutoRaccoonDailyGrant != nil {
+		return *state.AutoRaccoonDailyGrant
+	}
+	return s.deps.Config().AutoRaccoonDailyGrant
+}
+
 // effectiveAutoCheckin 返回是否启用自动签到（页面设置优先）。
 func (s *Service) effectiveAutoCheckin() bool {
 	state := s.deps.State()
@@ -193,11 +217,12 @@ func (s *Service) effectiveAutoCheckin() bool {
 // effectiveSettings 返回页面设置与配置合并后的可读视图。
 func (s *Service) effectiveSettings() map[string]any {
 	return map[string]any{
-		"auto_checkin":    s.effectiveAutoCheckin(),
-		"auto_checkin_at": s.checkinAt(),
-		"auto_tasks":      s.effectiveAutoTasks(),
-		"schedule":        s.effectiveSchedule(),
-		"task_specs":      s.catalog.Specs(),
+		"auto_checkin":             s.effectiveAutoCheckin(),
+		"auto_checkin_at":          s.checkinAt(),
+		"auto_tasks":               s.effectiveAutoTasks(),
+		"auto_raccoon_daily_grant": s.effectiveAutoRaccoonDailyGrant(),
+		"schedule":                 s.effectiveSchedule(),
+		"task_specs":               s.catalog.Specs(),
 	}
 }
 
@@ -211,11 +236,11 @@ func (s *Service) forEachAccount(ctx context.Context, callbackID string, targets
 		EnabledRealms: cfg.EnabledRealms,
 	})
 	for _, failure := range failures {
-		logger.Debug("skip account %s: %s", core.FirstNonEmpty(failure.Entry.Name, failure.Entry.ID), failure.Message)
+		logger.Debug("跳过账号 %s：%s", core.FirstNonEmpty(failure.Entry.Name, failure.Entry.ID), failure.Message)
 	}
 	for _, account := range accounts {
 		if errRun := fn(hostbridge.WithAuthIndex(ctx, account.Entry.AuthIndex), newAccountContext(account)); errRun != nil {
-			logger.Debug("account %s task failed: %v", core.FirstNonEmpty(account.Entry.Label, account.Entry.Name), errRun)
+			logger.Debug("账号 %s 任务失败：%v", core.FirstNonEmpty(account.Entry.Label, account.Entry.Name), errRun)
 		}
 		if !core.SleepContext(ctx, accountGap) {
 			return
@@ -258,10 +283,10 @@ func (a *accountContext) label() string {
 // runCheckinAll 执行全账号签到，并在启用自动任务时驱动从属闭环。
 func (s *Service) runCheckinAll(ctx context.Context) {
 	if !s.effectiveAutoCheckin() {
-		logger.Debug("checkin skipped: auto checkin is disabled")
+		logger.Debug("已跳过签到：自动签到未开启")
 		return
 	}
-	logger.Info("checkin: starting for all accounts")
+	logger.Info("签到：开始处理全部账号")
 	count := 0
 	s.forEachAccount(ctx, "", nil, func(ctx context.Context, account *accountContext) error {
 		if !core.SupportsCheckinFor(account.vendor, account.credential) {
@@ -269,7 +294,7 @@ func (s *Service) runCheckinAll(ctx context.Context) {
 		}
 		result, errCheckin := s.Checkin(ctx, account.vendor, account.credential, CheckinTriggerSchedule)
 		if errCheckin != nil {
-			logger.Error("checkin %s: %v", account.label(), errCheckin)
+			logger.Error("签到 %s：%v", account.label(), errCheckin)
 			return nil
 		}
 		switch {
@@ -277,16 +302,16 @@ func (s *Service) runCheckinAll(ctx context.Context) {
 			// 本次没真正领到（窗口未开启 / 领取被拒 / 未确认发放）。
 			// 用 Info 而不是 Error：上游窗口未开启是正常状态，不是故障；
 			// 但措辞要如实，别让它看起来像签到成功了。
-			logger.Info("checkin %s: not completed: %s", account.label(), result.Message)
+			logger.Info("签到 %s：未完成：%s", account.label(), result.Message)
 		case result.Already:
-			logger.Info("checkin %s: already checked in today", account.label())
+			logger.Info("签到 %s：今天已签到", account.label())
 		default:
-			logger.Info("checkin %s: %s", account.label(), result.Message)
+			logger.Info("签到 %s：%s", account.label(), result.Message)
 		}
 		count++
 		return nil
 	})
-	logger.Info("checkin: finished for %d account(s)", count)
+	logger.Info("签到：已完成 %d 个账号", count)
 
 	if s.effectiveAutoTasks() {
 		for _, spec := range s.catalog.Specs() {
@@ -304,25 +329,40 @@ func (s *Service) runCheckinAll(ctx context.Context) {
 // 落盘」只有一份实现，供应商包也不必依赖 internal/hostbridge。
 func (s *Service) runScheduledFamily(ctx context.Context, kind string) {
 	logger.Info("%s: starting for all accounts", kind)
-	count := 0
+	done, idle, failed := 0, 0, 0
 	s.forEachAccount(ctx, "", nil, func(ctx context.Context, account *accountContext) error {
 		if kind == core.TaskKindKeepalive {
 			result := s.keepaliveOne(ctx, "", account)
 			if !result.OK {
 				logger.Error("%s %s: %s", kind, account.label(), result.Message)
+				failed++
 				return nil
 			}
 			logger.Info("%s %s: %s", kind, account.label(), result.Message)
-			count++
+			done++
 			return nil
 		}
-		if message := s.runScheduledForAccount(ctx, account, kind); message != "" {
+		message, errRun := s.runScheduledForAccount(ctx, account, kind)
+		switch {
+		case errRun != nil:
+			logger.Error("%s %s: %v", kind, account.label(), errRun)
+			failed++
+		case message == "":
+			idle++
+		default:
 			logger.Info("%s %s: %s", kind, account.label(), message)
-			count++
+			done++
 		}
 		return nil
 	})
-	logger.Info("%s: finished for %d account(s)", kind, count)
+	// 「finished for 0 account(s)」曾经把「没事可做」和「全挂了」显示成同一个
+	// 数字：供应商的失败分支返回空字符串，计数不增也不报错。分开报，别让人
+	// 对着一个 0 猜今天到底跑没跑。
+	if idle > 0 || failed > 0 {
+		logger.Info("%s: finished for %d account(s)（无事可做 %d，失败 %d）", kind, done, idle, failed)
+		return
+	}
+	logger.Info("%s: finished for %d account(s)", kind, done)
 }
 
 // runScheduledForAccount 让账号所属供应商执行一个定时任务族，返回可读结果。
@@ -330,18 +370,16 @@ func (s *Service) runScheduledFamily(ctx context.Context, kind string) {
 // 排程是全局的（task_schedules 不区分供应商与账号），执行前必须按供应商声明的
 // TaskSpecs 过滤：未声明的族对它没有实现，静默跳过即可，不能落 ERROR——否则
 // 每到一个排程点就刷一条「unknown scheduled task kind」，把真实错误淹没（issue #58）。
-func (s *Service) runScheduledForAccount(ctx context.Context, account *accountContext, kind string) string {
+//
+// 返回值区分三态：message 非空 = 真做了事；message 空且 err 为 nil = 无事可做；
+// err 非空 = 失败。供应商不许把失败折成空字符串，那样上层只能瞎猜。
+func (s *Service) runScheduledForAccount(ctx context.Context, account *accountContext, kind string) (string, error) {
 	ctx = hostbridge.WithAuthIndex(ctx, account.entry.AuthIndex)
 	runner, okRunner := core.As[core.ScheduledRunner](account.vendor)
 	if !okRunner || !core.SupportsScheduledKind(account.vendor, kind) {
-		return ""
+		return "", nil
 	}
-	message, errRun := runner.RunScheduled(ctx, account.credential, kind)
-	if errRun != nil {
-		logger.Error("%s %s: %v", kind, account.label(), errRun)
-		return ""
-	}
-	return message
+	return runner.RunScheduled(ctx, account.credential, kind)
 }
 
 const (
@@ -349,37 +387,69 @@ const (
 	queueMaxConcurrency = 4
 )
 
-func (s *Service) tryLockAccount(uid string) bool {
+// accountLock 取某个账号的锁句柄（容量 1 的 channel，持有即已放入一个值）。
+//
+// 用 channel 而不是 sync.Mutex：Mutex.Lock 不可取消，批量任务在 ctx 被取消后
+// 仍会永久卡在 Lock 上；channel 版本能和 ctx.Done() 一起 select，取消即走。
+func (s *Service) accountLock(uid string) chan struct{} {
 	trimmed := strings.TrimSpace(uid)
 	if trimmed == "" {
-		return false
+		return nil
 	}
 	s.taskLockMu.Lock()
 	if s.taskLocks == nil {
-		s.taskLocks = map[string]*sync.Mutex{}
+		s.taskLocks = map[string]chan struct{}{}
 	}
 	lock, okLock := s.taskLocks[trimmed]
 	if !okLock {
-		lock = &sync.Mutex{}
+		lock = make(chan struct{}, 1)
 		s.taskLocks[trimmed] = lock
 	}
 	s.taskLockMu.Unlock()
-	return lock.TryLock()
+	return lock
+}
+
+// tryLockAccount 非阻塞抢锁。手动单任务用这个：抢不到就明确告诉用户
+// 「该账号有任务正在执行」，不让人对着转圈等。
+func (s *Service) tryLockAccount(uid string) bool {
+	lock := s.accountLock(uid)
+	if lock == nil {
+		return false
+	}
+	select {
+	case lock <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// lockAccount 排队等锁，ctx 取消时返回错误。
+//
+// 批量动作（一键完成、任务队列）必须用这个：它们和彼此抢的是同一把账号锁，
+// 抢不到就跳过会让用户看到一堆「该账号有其它任务动作在执行」的假失败——
+// 实际上只是排在后面。排队是正确语义，跳过不是。
+func (s *Service) lockAccount(ctx context.Context, uid string) error {
+	lock := s.accountLock(uid)
+	if lock == nil {
+		return fmt.Errorf("账号标识为空，无法排队")
+	}
+	select {
+	case lock <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (s *Service) unlockAccount(uid string) {
-	trimmed := strings.TrimSpace(uid)
-	if trimmed == "" {
+	lock := s.accountLock(uid)
+	if lock == nil {
 		return
 	}
-	s.taskLockMu.Lock()
-	if s.taskLocks == nil {
-		s.taskLocks = map[string]*sync.Mutex{}
-	}
-	lock, okLock := s.taskLocks[trimmed]
-	s.taskLockMu.Unlock()
-	if okLock {
-		lock.Unlock()
+	select {
+	case <-lock:
+	default:
 	}
 }
 
@@ -578,15 +648,15 @@ func (s *Service) runQueueItems(callbackID string, concurrency int, seq int64) {
 	auth.RunBatch(jobs, concurrency, func(job queueJob) struct{} {
 		target := job.account
 		ctx := hostbridge.WithAuthIndex(ctx, target.entry.AuthIndex)
-		if !s.tryLockAccount(target.uid()) {
-			s.markQueueItems(job.indices, "skipped", "该账号有其它任务动作在执行", 0, 0)
+		if errLock := s.lockAccount(ctx, target.uid()); errLock != nil {
+			s.markQueueItems(job.indices, "skipped", "等待该账号的其它任务超时："+errLock.Error(), 0, 0)
 			return struct{}{}
 		}
 		defer s.unlockAccount(target.uid())
 
 		if preparer, okPreparer := core.As[core.TaskPreparer](target.vendor); okPreparer {
 			if accepted := preparer.PrepareTasks(ctx, target.credential); accepted > 0 {
-				logger.Debug("queue: accepted %d task(s) for %s", accepted, target.label())
+				logger.Debug("队列：已接受 %d 个任务（%s）", accepted, target.label())
 				core.SleepContext(ctx, 1050*time.Millisecond)
 			}
 		}
@@ -603,7 +673,7 @@ func (s *Service) runQueueItems(callbackID string, concurrency int, seq int64) {
 		}
 		return struct{}{}
 	})
-	logger.Info("task queue finished (seq=%d)", seq)
+	logger.Info("任务队列已结束（序号=%d）", seq)
 }
 
 // runTaskForAccount 调用供应商的任务执行能力并记录结果。

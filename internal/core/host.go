@@ -61,6 +61,8 @@ type Settings struct {
 	AutoCheckin   bool
 	AutoCheckinAt string
 	AutoTasks     bool
+	// AutoRaccoonDailyGrant 开启小浣熊「每日积分」任务。
+	AutoRaccoonDailyGrant bool
 	// LogLevel 是日志级别。
 	LogLevel string
 }

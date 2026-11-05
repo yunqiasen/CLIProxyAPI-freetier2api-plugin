@@ -19,8 +19,6 @@ import (
 	"freetier2api-plugin/internal/logger"
 
 	_ "embed"
-	"regexp"
-	"sync"
 )
 
 // 本文件是 CodeBuddy 协议的客户端核心：请求发送、统一信封处理、凭证刷新、
@@ -69,13 +67,6 @@ type Options struct {
 	Context context.Context
 	// EnabledRealms 是启用的域（cn / global 子集）。
 	EnabledRealms []string
-	// PromptMode / PromptText 控制系统提示词处理。
-	PromptMode string
-	PromptText string
-	// OnContentBlocked 是内容审核拦截时的回调（触发提示词降级）。
-	OnContentBlocked func()
-	// SanitizeFingerprints 开启出站请求体黑名单脱敏。
-	SanitizeFingerprints bool
 	// PassthroughIP 决定是否把客户端 IP 透传给上游。
 	PassthroughIP bool
 	// UserAgent 显式覆盖出站 UA。
@@ -214,13 +205,13 @@ func unwrapEnvelope(status int, body string, header http.Header) (json.RawMessag
 // 两者都解析出来交给调用方，由它决定冷却到哪个时刻。
 func enrichClassifyError(status int, body string, header http.Header) *core.Failure {
 	classified := Classify(status, body)
-	classified.RetryAfter = ParseRetryAfter(header, time.Now())
+	classified.RetryWait = ParseRetryAfter(header, time.Now())
 	classified.ResetAt = ParseRateReset(body)
 	if classified.Kind == core.FailureKindChannelRejected {
 		// 渠道校验是上游新增的策略拦截，插件侧没有（也不该有）伪造官方客户端证明的手段。
 		// 返回给用户的消息已折叠成人话，日志里保留全量正文：requestId 是反馈上游、
 		// 以及日后比对协议差异时唯一的证据，折叠后就只剩这一份。
-		logger.Error("upstream channel verification rejected the request (status=%d): %s",
+		logger.Error("上游渠道校验拒绝该请求（状态=%d）：%s",
 			status, core.Truncate(body, 1024))
 	}
 	return classified
@@ -326,9 +317,6 @@ func (c *Client) ChatStream(req ChatRequest) (io.ReadCloser, error) {
 	defaultEfforts, supportedEfforts := c.rt.effortTables()
 	prepared := PrepareBody(req.Body, PrepareOptions{
 		Model:            model,
-		PromptMode:       c.opts.PromptMode,
-		PromptText:       c.opts.PromptText,
-		Sanitize:         c.opts.SanitizeFingerprints,
 		DefaultEfforts:   defaultEfforts,
 		SupportedEfforts: supportedEfforts,
 		CacheKey:         cacheKey,
@@ -351,11 +339,7 @@ func (c *Client) ChatStream(req ChatRequest) (io.ReadCloser, error) {
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, apiBodyLimit))
 		closeBody(resp.Body)
-		errClassified := enrichClassifyError(resp.StatusCode, string(body), resp.Header)
-		if errClassified != nil && errClassified.Kind == core.FailureKindContentBlocked && c.opts.OnContentBlocked != nil {
-			c.opts.OnContentBlocked()
-		}
-		return nil, errClassified
+		return nil, enrichClassifyError(resp.StatusCode, string(body), resp.Header)
 	}
 	return resp.Body, nil
 }
@@ -460,8 +444,12 @@ type Endpoints struct {
 	Origin string
 	// AcceptLanguage 是该域的默认语言偏好。
 	AcceptLanguage string
-	// PlatformLabel 是 UA 中的平台段（global 必须是 "WorkBuddy AI"，否则触发风控）。
+	// PlatformLabel 是 UA 中的平台段（CN 为 WorkBuddy，Global 为 workbuddy-ai）。
 	PlatformLabel string
+	// ClientVersion 是官方客户端版本（CN 为 5.8.3，Global 为 5.8.4）。
+	ClientVersion string
+	// CLIVersion 是官方客户端内置 CLI 版本（CN 为 2.179.0，Global 为 2.161.0）。
+	CLIVersion string
 }
 
 var (
@@ -472,9 +460,11 @@ var (
 		ChatBase:       "https://www.workbuddy.cn",
 		BillingBase:    "https://www.codebuddy.cn",
 		WebBase:        "https://www.workbuddy.cn",
-		Origin:         "https://www.codebuddy.cn",
+		Origin:         "https://www.workbuddy.cn",
 		AcceptLanguage: "zh-CN",
 		PlatformLabel:  "WorkBuddy",
+		ClientVersion:  "5.8.3",
+		CLIVersion:     "2.179.0",
 	}
 	endpointsGlobal = Endpoints{
 		ChatBase:       "https://www.workbuddy.ai",
@@ -482,7 +472,9 @@ var (
 		WebBase:        "https://www.workbuddy.ai",
 		Origin:         "https://www.workbuddy.ai",
 		AcceptLanguage: "en-US",
-		PlatformLabel:  "WorkBuddy AI",
+		PlatformLabel:  "workbuddy-ai",
+		ClientVersion:  "5.8.4",
+		CLIVersion:     "2.161.0",
 	}
 )
 
@@ -649,16 +641,16 @@ func (c *Client) userAgent(region Region) string {
 	if override := strings.TrimSpace(c.opts.UserAgent); override != "" {
 		return override
 	}
+	ep := GetEndpoints(region)
 	clientVersion := c.opts.ClientVersion
 	if clientVersion == "" {
-		clientVersion = defaultClientVersion
+		clientVersion = ep.ClientVersion
 	}
 	cliVersion := c.opts.CLIVersion
 	if cliVersion == "" {
-		cliVersion = defaultCLIVersion
+		cliVersion = ep.CLIVersion
 	}
-	platform := GetEndpoints(region).PlatformLabel
-	return "WorkBuddy/" + clientVersion + " " + platform + "/" + clientVersion + " CLI/" + cliVersion
+	return "WorkBuddy/" + clientVersion + " " + ep.PlatformLabel + "/" + clientVersion + " CLI/" + cliVersion
 }
 
 // applyChatHeaders 写入对话请求专有的头。
@@ -666,10 +658,8 @@ func (c *Client) applyChatHeaders(req *http.Request, cred *Credential, meta Chat
 	applyCommonHeaders(req, c, cred)
 	applyAuthHeaders(req, cred)
 
-	// 正版对话请求（CLI 直发路径）不带 Origin/Referer/Accept-Language，
-	// 也不带设备指纹三头（X-Device-Token 仅用于签到与 auth/state）。
+	// 对话请求不发设备指纹与会话 ID 派生头（它们仅用于反馈上报与计费/签到）。
 	for _, key := range []string{
-		"Origin", "Referer", "Accept-Language",
 		"X-Device-Token", "X-Machine-ID", "X-Session-ID",
 	} {
 		req.Header.Del(key)
@@ -680,7 +670,6 @@ func (c *Client) applyChatHeaders(req *http.Request, cred *Credential, meta Chat
 	// 企业与域信息：CN 与 global 的形态不同，写错会被拒。
 	// X-Domain 与正版一致取当前对话域主机名（个人账号也恒发）。
 	if cred.Realm().IsGlobal() {
-		req.Header.Set("X-No-Enterprise-Id", "1")
 		req.Header.Set("X-Domain", endpointHost(GetEndpoints(RegionGlobal).ChatBase))
 	} else {
 		if enterpriseID := cred.EnterpriseIDValue(); enterpriseID != "" {
@@ -692,7 +681,7 @@ func (c *Client) applyChatHeaders(req *http.Request, cred *Credential, meta Chat
 		req.Header.Set("X-Domain", endpointHost(GetEndpoints(cred.Realm()).ChatBase))
 	}
 
-	applyAttributionHeaders(req, c)
+	applyAttributionHeaders(req, c, cred.Realm())
 	applyConversationHeaders(req, meta)
 
 	if c.opts.PassthroughIP && strings.TrimSpace(clientIP) != "" {
@@ -704,14 +693,15 @@ func (c *Client) applyChatHeaders(req *http.Request, cred *Credential, meta Chat
 
 // applyAttributionHeaders 写入客户端归属头。
 //
-// 正版恒定发送：X-Product=SaaS（deploymentType）、X-IDE-Type/X-IDE-Name=WorkBuddy、
-// X-IDE-Version=应用版本、X-Agent-Intent=craft、X-Agent-Type=main、X-Private-Data=false。
-// client_name 显式配成 "SaaS" 时还原旧行为（只发 X-Product），保留这个开关
-// 是为了在归属头引起风控变化时能快速回退。
-func applyAttributionHeaders(req *http.Request, c *Client) {
+// 官方 5.8.4 对齐：X-Product=SaaS、X-IDE-Type/X-IDE-Name=WorkBuddy、
+// X-IDE-Version=应用版本（CN 5.8.3 / Global 5.8.4）、
+// X-Agent-Intent=craft、X-Agent-Purpose=conversation、X-Agent-Type=main。
+// 国际版实测 X-Private-Data 恒为 true。
+func applyAttributionHeaders(req *http.Request, c *Client, region Region) {
+	ep := GetEndpoints(region)
 	clientVersion := c.opts.ClientVersion
 	if clientVersion == "" {
-		clientVersion = defaultClientVersion
+		clientVersion = ep.ClientVersion
 	}
 	name := strings.TrimSpace(c.opts.ClientName)
 	if name == "" {
@@ -727,7 +717,11 @@ func applyAttributionHeaders(req *http.Request, c *Client) {
 	req.Header.Set("X-IDE-Name", name)
 	req.Header.Set("X-IDE-Type", name)
 	req.Header.Set("X-IDE-Version", clientVersion)
-	req.Header.Set("X-Private-Data", "false")
+	if region.IsGlobal() {
+		req.Header.Set("X-Private-Data", "true")
+	} else {
+		req.Header.Set("X-Private-Data", "false")
+	}
 	req.Header.Set("X-Product", "SaaS")
 }
 
@@ -744,15 +738,11 @@ func endpointHost(base string) string {
 
 // applyConversationHeaders 写入会话头族。
 //
-// 正版形态（CLI 直发路径）：
-//   - X-Conversation-Request-ID：每轮稳定（UUIDv7-32hex）；
+// 5.8.4 渠道校验（11128）要求必须携带完整的会话头族与链路头族：
+//   - X-Conversation-ID：带连字符的标准 UUID（RFC 4122/9562），未指定时现生成；
+//   - X-Conversation-Request-ID / X-Root-Request-ID：每轮生成（UUIDv7-32hex，两者同值）；
 //   - X-Conversation-Message-ID / X-Request-ID：每步新生（UUIDv7-32hex，两者同值）；
-//   - X-Root-Request-ID / X-Parent-Conversation-ID：仅子会话才有，主对话不发；
-//   - trace 族每请求随机：traceId 32hex、spanId 16hex、parentSpanId 16hex，
-//     traceparent/b3/X-B3-*/X-Trace-ID 同源。
-//
-// 这一族头看似冗余（多个头取同一个值），但上游后台按它们做请求聚合与链路追踪，
-// 缺任意一个都会让会话在后台被拆散。
+//   - trace 族每请求同源随机：traceId 32hex、spanId 16hex，b3 为 traceId-spanId-1。
 func applyConversationHeaders(req *http.Request, meta ChatMeta) {
 	messageID := strings.TrimSpace(meta.MessageID)
 	if messageID == "" {
@@ -762,22 +752,22 @@ func applyConversationHeaders(req *http.Request, meta ChatMeta) {
 	if conversationRequestID == "" {
 		conversationRequestID = messageID
 	}
-	if conversationID := strings.TrimSpace(meta.ConversationID); conversationID != "" {
-		req.Header.Set("X-Conversation-ID", conversationID)
+	conversationID := strings.TrimSpace(meta.ConversationID)
+	if len(conversationID) != 36 || strings.Count(conversationID, "-") != 4 {
+		conversationID = NewUUIDv7()
 	}
+	req.Header.Set("X-Conversation-ID", conversationID)
 	req.Header.Set("X-Conversation-Request-ID", conversationRequestID)
+	req.Header.Set("X-Root-Request-ID", conversationRequestID)
 	req.Header.Set("X-Conversation-Message-ID", messageID)
 	req.Header.Set("X-Request-ID", messageID)
 
-	// trace 族：全随机且互相同源（正版由 otel 注入，不复用会话 ID）。
 	traceID := core.RandomHex(16)
 	spanID := core.RandomHex(8)
-	parentSpanID := core.RandomHex(8)
 	req.Header.Set("traceparent", "00-"+traceID+"-"+spanID+"-01")
-	req.Header.Set("b3", traceID+"-"+spanID+"-1-"+parentSpanID)
+	req.Header.Set("b3", traceID+"-"+spanID+"-1")
 	req.Header.Set("X-B3-TraceId", traceID)
 	req.Header.Set("X-B3-SpanId", spanID)
-	req.Header.Set("X-B3-ParentSpanId", parentSpanID)
 	req.Header.Set("X-B3-Sampled", "1")
 	req.Header.Set("X-Trace-ID", traceID)
 }
@@ -1520,12 +1510,6 @@ func ChatMetaFromBody(body []byte) ChatMeta {
 type PrepareOptions struct {
 	// Model 是目标模型裸名。非空时直接改写 payload["model"]。
 	Model string
-	// PromptMode 提示词模式：passthrough / custom / append。
-	PromptMode string
-	// PromptText 自定义或追加的提示词内容。
-	PromptText string
-	// Sanitize 开启指纹脱敏（第 12 步）。
-	Sanitize bool
 	// DefaultEfforts 是模型名 → 默认档位的表（来自模型目录）。
 	DefaultEfforts map[string]string
 	// SupportedEfforts 是模型名 → 支持档位列表的表（来自模型目录）。
@@ -1576,9 +1560,6 @@ func PrepareBody(body []byte, opts PrepareOptions) []byte {
 	// 5) developer → system。
 	normalizeRoles(payload)
 
-	// 5.5) 系统提示词处理（透传 / 替换 / 追加）。
-	applyPromptMode(payload, opts.PromptMode, opts.PromptText)
-
 	// 6) image_url 归一。
 	normalizeImageURL(payload)
 
@@ -1615,13 +1596,6 @@ func PrepareBody(body []byte, opts PrepareOptions) []byte {
 	if strings.TrimSpace(opts.CacheKey) != "" {
 		if _, okKey := payload["prompt_cache_key"]; !okKey {
 			payload["prompt_cache_key"] = opts.CacheKey
-		}
-	}
-
-	// 12) 指纹脱敏（放最后：前面步骤可能引入需要净化的文本）。
-	if opts.Sanitize {
-		if messages, okMessages := payload["messages"].([]any); okMessages {
-			sanitizeMessages(messages)
 		}
 	}
 
@@ -1813,57 +1787,6 @@ func defaultEffortFor(table map[string]string, model string) string {
 		return ""
 	}
 	return strings.TrimSpace(table[strings.TrimSpace(model)])
-}
-
-// applyPromptMode 处理系统提示词：custom 替换全部 system/developer；append 在开头连续 system 块后追加。
-func applyPromptMode(payload map[string]any, mode, text string) {
-	mode = strings.ToLower(strings.TrimSpace(mode))
-	text = strings.TrimSpace(text)
-	if mode == "" || mode == "passthrough" || text == "" {
-		return
-	}
-	messages, okMessages := payload["messages"].([]any)
-	if !okMessages {
-		return
-	}
-	if mode == "custom" {
-		kept := make([]any, 0, len(messages)+1)
-		kept = append(kept, map[string]any{"role": "system", "content": text})
-		for _, item := range messages {
-			msgMap, okMap := item.(map[string]any)
-			if !okMap {
-				kept = append(kept, item)
-				continue
-			}
-			role, _ := msgMap["role"].(string)
-			switch strings.ToLower(strings.TrimSpace(role)) {
-			case "system", "developer":
-				continue
-			}
-			kept = append(kept, item)
-		}
-		payload["messages"] = kept
-	} else if mode == "append" {
-		insertAt := 0
-		for insertAt < len(messages) {
-			msgMap, okMap := messages[insertAt].(map[string]any)
-			if !okMap {
-				break
-			}
-			role, _ := msgMap["role"].(string)
-			switch strings.ToLower(strings.TrimSpace(role)) {
-			case "system", "developer":
-				insertAt++
-				continue
-			}
-			break
-		}
-		out := make([]any, 0, len(messages)+1)
-		out = append(out, messages[:insertAt]...)
-		out = append(out, map[string]any{"role": "system", "content": text})
-		out = append(out, messages[insertAt:]...)
-		payload["messages"] = out
-	}
 }
 
 // decodeBodyMap 把请求体解析成 map。解析失败返回 nil（调用方按"无法解析"处理）。
@@ -2367,232 +2290,4 @@ func StripToolCallNames(frame map[string]any, seen map[int]bool) {
 			}
 		}
 	}
-}
-
-// 本文件实现出站请求体的指纹脱敏。
-//
-// 背景：第三方 harness（Claude Code / Codex CLI / DSH 等）会在 system prompt 里
-// 注入若干固定模板句，上游的内容审核是**逐字精确匹配**（不是语义审核），
-// 一字改动即可绕过。
-//
-// 策略分两层：
-//   - 键值/header 型指纹：整段剥离（它本身就是注入痕迹，不含用户语义）；
-//   - 承载语义的模板句：最小改写（换一个词），语义不变。
-//
-// 规则表从 catalog 同级的 sanitize_rules.json 读取（内嵌），
-// 便于审计「到底改了哪些字面量」，也避免 Go 源码里出现大量易被误改的临界字符串。
-
-//go:embed assets/sanitize_rules.json
-var sanitizeRulesRaw []byte
-
-// sanitizeRules 是脱敏规则。
-type sanitizeRules struct {
-	// Features 是特征预检串：任一命中才进入净化（普通请求零开销）。
-	Features []string `json:"features"`
-	// Rewrites 是 [原文, 改写] 对。
-	Rewrites [][2]string `json:"rewrites"`
-	// Regexes 是整段剥离用的正则（按名字取用）。
-	Regexes map[string]string `json:"regexes"`
-}
-
-var (
-	sanitizeOnce    sync.Once
-	sanitizeRuleSet sanitizeRules
-	sanitizeRegexes map[string]*regexp.Regexp
-)
-
-func loadSanitizeRules() (sanitizeRules, map[string]*regexp.Regexp) {
-	sanitizeOnce.Do(func() {
-		var rules sanitizeRules
-		if errUnmarshal := json.Unmarshal(sanitizeRulesRaw, &rules); errUnmarshal != nil {
-			// 内嵌资源损坏是构建期问题：没有规则就退化为「不脱敏」，
-			// 而不是让插件启动失败（脱敏是加分项，不是必需项）。
-			rules = sanitizeRules{}
-		}
-		compiled := map[string]*regexp.Regexp{}
-		for name, pattern := range rules.Regexes {
-			if strings.TrimSpace(pattern) == "" {
-				continue
-			}
-			expr, errCompile := regexp.Compile(pattern)
-			if errCompile != nil {
-				// 规则写坏时跳过该条，而不是 panic。
-				continue
-			}
-			compiled[name] = expr
-		}
-		sanitizeRuleSet = rules
-		sanitizeRegexes = compiled
-	})
-	return sanitizeRuleSet, sanitizeRegexes
-}
-
-// sanitizeMessages 净化请求体里的全部文本。
-//
-// 净化范围：content（字符串或 parts 里的文本）、reasoning/reasoning_content、
-// tool_calls 的参数（它是字符串化 JSON，按文本走）。**图片 part 不动**。
-//
-// 返回值报告是否发生了改动。
-func sanitizeMessages(messages []any) bool {
-	rules, regexes := loadSanitizeRules()
-	changed := false
-	for _, item := range messages {
-		message, okMessage := item.(map[string]any)
-		if !okMessage {
-			continue
-		}
-		// 注意：这里**不能**在 content 缺失时 continue。
-		// 工具调用消息的 content 通常是 null，早期版本因此在 content 缺失时跳过，
-		// 导致 tool_calls 里的参数完全不被净化——写进工具参数（文件名、命令、
-		// 写入内容）的被拦字符串会原样漏出。
-		if content, okContent := message["content"]; okContent {
-			if updated, didChange := sanitizeContent(content, rules, regexes); didChange {
-				message["content"] = updated
-				changed = true
-			}
-		}
-		for _, key := range []string{"reasoning", "reasoning_content"} {
-			if text, okText := message[key].(string); okText {
-				if updated := sanitizeText(text, rules, regexes); updated != text {
-					message[key] = updated
-					changed = true
-				}
-			}
-		}
-		if calls, okCalls := message["tool_calls"].([]any); okCalls {
-			if sanitizeToolCalls(calls, rules, regexes) {
-				changed = true
-			}
-		}
-	}
-	return changed
-}
-
-// sanitizeContent 净化消息内容（字符串或 parts 数组）。
-func sanitizeContent(content any, rules sanitizeRules, regexes map[string]*regexp.Regexp) (any, bool) {
-	switch typed := content.(type) {
-	case string:
-		updated := sanitizeText(typed, rules, regexes)
-		return updated, updated != typed
-	case []any:
-		changed := false
-		for _, item := range typed {
-			part, okPart := item.(map[string]any)
-			if !okPart {
-				continue
-			}
-			// 图片 part 不动：净化文本字段之外的内容会破坏图片。
-			if partType, okType := part["type"].(string); okType && partType == "image_url" {
-				continue
-			}
-			text, okText := part["text"].(string)
-			if !okText {
-				continue
-			}
-			if updated := sanitizeText(text, rules, regexes); updated != text {
-				part["text"] = updated
-				changed = true
-			}
-		}
-		return typed, changed
-	}
-	return content, false
-}
-
-// sanitizeToolCalls 净化工具调用的参数与名称。
-func sanitizeToolCalls(calls []any, rules sanitizeRules, regexes map[string]*regexp.Regexp) bool {
-	changed := false
-	for _, item := range calls {
-		call, okCall := item.(map[string]any)
-		if !okCall {
-			continue
-		}
-		function, okFunction := call["function"].(map[string]any)
-		if !okFunction {
-			continue
-		}
-		if arguments, okArgs := function["arguments"].(string); okArgs {
-			if updated := sanitizeText(arguments, rules, regexes); updated != arguments {
-				function["arguments"] = updated
-				changed = true
-			}
-		}
-	}
-	return changed
-}
-
-// hasFingerprint 特征预检：快速判断文本是否需要净化。
-//
-// 用 strings.Contains 走快路径：绝大多数请求全不命中，
-// 直接跳过后面所有正则与改写（零分配）。
-func hasFingerprint(text string, rules sanitizeRules) bool {
-	for _, feature := range rules.Features {
-		if strings.Contains(text, feature) {
-			return true
-		}
-	}
-	return false
-}
-
-// zeroWidthChars 是第三方 harness 用来规避字面量匹配的不可见字符。
-//
-// DSH 的部分构建在 "DeepSeek Harness" 之间插入零宽空格（U+200B）：肉眼与原文
-// 一致、字节不同，任何 strings.ReplaceAll 都会落空。因此先做一次清理，
-// 让改写表（第 3 步）能命中。只在指纹预检命中后清理——未命中特征的正文
-// （普通用户消息）原样透传，不做任何字符级改动。
-const zeroWidthChars = "\u200b\u200c\u200d\ufeff"
-
-// stripZeroWidth 删除文本里的零宽字符；不含时直接返回原串（零分配快路径）。
-func stripZeroWidth(text string) string {
-	if !strings.ContainsAny(text, zeroWidthChars) {
-		return text
-	}
-	return strings.Map(func(r rune) rune {
-		if strings.ContainsRune(zeroWidthChars, r) {
-			return -1
-		}
-		return r
-	}, text)
-}
-
-// sanitizeText 对一段文本执行完整脱敏。
-//
-// 执行顺序：
-//  1. 特征预检（不命中直接返回原串）；
-//  2. 零宽字符清理（部分 harness 用不可见字符规避字面量匹配）；
-//  3. 改写表（承载语义的模板句，逐词替换）；
-//  4. header 键值段整段剥离；
-//  5. cc_ 键值段循环清理（直到稳定）；
-//  6. 裸 header 键名缩写。
-func sanitizeText(text string, rules sanitizeRules, regexes map[string]*regexp.Regexp) string {
-	if text == "" || !hasFingerprint(text, rules) {
-		return text
-	}
-	text = stripZeroWidth(text)
-	for _, pair := range rules.Rewrites {
-		if len(pair) != 2 || pair[0] == "" {
-			continue
-		}
-		text = strings.ReplaceAll(text, pair[0], pair[1])
-	}
-	if expr := regexes["sanitizeHdrRe"]; expr != nil {
-		text = expr.ReplaceAllString(text, "")
-	}
-	if expr := regexes["sanitizeKvRe"]; expr != nil {
-		// 循环清理直到稳定：一条规则剥掉前缀后可能让下一条匹配露出来。
-		for previous := ""; previous != text; {
-			previous = text
-			text = expr.ReplaceAllString(text, "")
-		}
-	}
-	if expr := regexes["sanitizeBareHdrRe"]; expr != nil {
-		text = expr.ReplaceAllStringFunc(text, func(match string) string {
-			// 把裸键名缩写成短形式，保留可读性同时不再是原字面量。
-			if len(match) > 4 {
-				return match[:len(match)-3] + "hdr"
-			}
-			return match
-		})
-	}
-	return strings.TrimSpace(text)
 }

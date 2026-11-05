@@ -63,7 +63,11 @@ func FetchBenefitModels(ctx context.Context, cred *Credential) ([]Model, error) 
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if errRead != nil {
+		// 半截 body 不能当完整响应交给解析层：网络问题会被误报成业务错误。
+		return nil, fmt.Errorf("read benefit models response: %w", errRead)
+	}
 	if resp.StatusCode >= 400 {
 		return nil, Classify(resp.StatusCode, string(body))
 	}
@@ -272,7 +276,7 @@ func FetchModels(ctx context.Context, cred *Credential) ([]Model, error) {
 	// 福利通道清单只在有凭证时拉取：它是「哪些模型能走每日免费额度」的唯一判据。
 	benefitModels, errBenefit := FetchBenefitModels(ctx, cred)
 	if errBenefit != nil {
-		logger.Debug("codearts: 拉取福利模型清单失败: %v", errBenefit)
+		logger.Debug("codearts：拉取福利模型清单失败：%v", errBenefit)
 		benefitModels = nil
 	}
 
@@ -306,12 +310,12 @@ func fetchBuiltinCatalog(ctx context.Context, cred *Credential) ([]byte, error) 
 func modelsFromCatalog(body []byte, errFetch error, benefit []Model) []Model {
 	fallback := func() []Model { return mergeBenefitModels(bundledModels(), benefit) }
 	if errFetch != nil {
-		logger.Debug("codearts: 拉取内置模型目录失败: %v", errFetch)
+		logger.Debug("codearts：拉取内置模型目录失败：%v", errFetch)
 		return fallback()
 	}
 	models, errParse := parseBuiltinModels(body)
 	if errParse != nil {
-		logger.Debug("codearts: 解析内置模型目录失败: %v", errParse)
+		logger.Debug("codearts：解析内置模型目录失败：%v", errParse)
 		return fallback()
 	}
 	if len(models) == 0 {

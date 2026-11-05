@@ -11,6 +11,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/app"
 	"freetier2api-plugin/internal/vendors/codearts"
 )
 
@@ -20,7 +21,8 @@ import (
 // 目录（11 个），于是面板刷新一次模型就少 5 个。两条路径都必须带凭证探测。
 func TestCodeArtsStaticAndAuthModelsStayInSync(t *testing.T) {
 	host := installFakeHost(t)
-	setupTestPlugin(t)
+	// 二开版保留「模型名渠道标识」开关且默认 off；本用例断言的是开 prefix 时的对外 ID。
+	setupTestPlugin(t, func(cfg *app.Config) { cfg.ModelNameTag = "prefix" })
 	host.addAccount("1", "codearts-user-1.json", codeartsCredentialJSON)
 	host.setUpstream(func(method, url, body string) fakeUpstreamResponse {
 		switch {
@@ -61,10 +63,12 @@ func TestCodeArtsStaticAndAuthModelsStayInSync(t *testing.T) {
 			t.Fatalf("model.static 缺少 %q（控制台会少模型）: static=%v", id, staticIDs)
 		}
 	}
-	if !authIDs["glm-5.3"] {
+	if !authIDs["codearts-glm-5.3"] {
 		t.Fatalf("福利模型必须进 /v1/models: %v", authIDs)
 	}
-	if authIDs["kimi-k2.6-vl"] {
+	// 内置目录写的是 kimi-k2.6-VL，福利清单给的是小写 vl；
+	// 合并后只保留内置写法，小写形态不得单独出现。
+	if !authIDs["codearts-kimi-k2.6-VL"] || authIDs["codearts-kimi-k2.6-vl"] {
 		t.Fatalf("大小写重复必须合并成内置目录的写法: %v", authIDs)
 	}
 }

@@ -95,6 +95,11 @@ func checkin(ctx context.Context, cred *Credential, benefitState *benefitCheckin
 
 	info, errInfo := fetchAccountInfo(ctx, cred)
 	if errInfo != nil {
+		// 凭证过期等 401 错误不得 fallback 到福利接口：凭证失效时打任何接口都会报签名或解密错误，
+		// 必须原样返回以保留 401 错误链供保活机制刷新凭据。
+		if core.IsAuthExpired(errInfo) {
+			return nil, errInfo
+		}
 		// 账户信息查不到时不能直接判失败：Token 计费账户本来就不在积分活动
 		// 范围，仍可能走福利 Token 通道。兜底也失败时保留两条链路的原因。
 		result, errFallback := claimBenefitTokenFallback(ctx, cred, false, benefitState)
@@ -245,7 +250,11 @@ type opsClaimResult struct {
 
 // claimOps 调用 /v1/ops/claim，body 与官方客户端逐字节一致。
 func claimOps(ctx context.Context, cred *Credential, campaignID string) (*opsClaimResult, error) {
-	body := []byte(`{"campaignId":"` + jsonEscape(campaignID) + `","channel":"` + OpsChannel + `"}`)
+	body, _ := json.Marshal(map[string]any{
+		"campaignId":    campaignID,
+		"idempotentKey": core.RandomHex(16),
+		"channel":       OpsChannel,
+	})
 	data, errClaim := signedSnapJSON(ctx, http.MethodPost, SnapEngineApiHost+EpOpsClaim, cred, body)
 	if errClaim != nil {
 		return nil, errClaim
@@ -277,6 +286,21 @@ func fetchAccountInfo(ctx context.Context, cred *Credential) (*accountInfo, erro
 
 // fetchDailyActivity 查询活动列表并挑出每日登录领取条目。
 func fetchDailyActivity(ctx context.Context, cred *Credential) (*opsActivity, error) {
+	activities, errFetch := fetchOpsActivities(ctx, cred)
+	if errFetch != nil {
+		return nil, errFetch
+	}
+	for _, activity := range activities {
+		if activity.Type == OpsDailyLoginType {
+			return activity, nil
+		}
+	}
+	return nil, nil
+}
+
+// fetchOpsActivities 拉取活动列表全部条目。签到只吃每日登录那一条，
+// 一键任务要吃剩下的全部可领活动，所以两边共用这一份解析。
+func fetchOpsActivities(ctx context.Context, cred *Credential) ([]*opsActivity, error) {
 	url := SnapEngineApiHost + EpOpsDelivery + "?channel=" + OpsChannel
 	data, errFetch := signedSnapJSON(ctx, http.MethodGet, url, cred, nil)
 	if errFetch != nil {
@@ -286,20 +310,25 @@ func fetchDailyActivity(ctx context.Context, cred *Credential) (*opsActivity, er
 	if !okItems {
 		return nil, fmt.Errorf("活动列表响应缺少 items 字段")
 	}
+	activities := make([]*opsActivity, 0, len(items))
 	for _, item := range items {
 		record, okRecord := item.(map[string]any)
-		if !okRecord || text(record, "type") != OpsDailyLoginType {
+		if !okRecord {
 			continue
 		}
-		return &opsActivity{
-			CampaignID: identifier(record, "campaignId"),
+		campaignID := identifier(record, "campaignId")
+		if campaignID == "" {
+			continue
+		}
+		activities = append(activities, &opsActivity{
+			CampaignID: campaignID,
 			Type:       text(record, "type"),
 			Claimable:  boolValue(record, "claimable"),
 			Status:     text(record, "status"),
 			Amount:     firstInt(record, "benefitAmount", "amount", "creditAmount"),
-		}, nil
+		})
 	}
-	return nil, nil
+	return activities, nil
 }
 
 // signedSnapJSON 发一次 snap-access 签名请求并解开 {code,message,data} 信封。
@@ -500,7 +529,11 @@ func fetchBenefitGatewayStatus(ctx context.Context, cred *Credential) (*BenefitG
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if errRead != nil {
+		// 半截 body 不能当完整响应交给解析层：网络问题会被误报成业务错误。
+		return nil, fmt.Errorf("read benefit status response: %w", errRead)
+	}
 	if resp.StatusCode >= 400 {
 		return nil, Classify(resp.StatusCode, string(body))
 	}
@@ -529,7 +562,11 @@ func claimBenefitToken(ctx context.Context, cred *Credential) (*BenefitClaim, er
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if errRead != nil {
+		// 半截 body 不能当完整响应交给解析层：网络问题会被误报成业务错误。
+		return nil, fmt.Errorf("read claim benefit response: %w", errRead)
+	}
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("claim benefit response %d: %s", resp.StatusCode, DescribeClaimError(string(body)))
 	}
@@ -619,12 +656,14 @@ func FetchQuota(ctx context.Context, cred *Credential) (*pluginapi.QuotaFetchRes
 			TierName: core.FirstNonEmpty(balance.Channel, "benefit"),
 			TierID:   "benefit",
 		},
+		// 顺序固定「剩余 → 总量 → 已用」，与其它渠道一致；控制台页头（插件 auth.Totals）取首个有容量的
+		// 族，把总量排前面会让同一排 chips 的阅读顺序和别家相反。
 		Summary: []pluginapi.QuotaMetric{
-			{Key: "total", Label: "每日免费额度", Value: float64(balance.DailyTokenLimit)},
 			{Key: "remaining", Label: "今日剩余", Value: float64(dailyLeft)},
+			{Key: "total", Label: "每日免费额度", Value: float64(balance.DailyTokenLimit)},
 			{Key: "used", Label: "今日已用", Value: float64(balance.DailyTokensUsed)},
-			{Key: "benefit_monthly_total", Label: "每月额度", Value: float64(balance.MonthlyTokenLimit)},
 			{Key: "benefit_monthly_remaining", Label: "本月剩余", Value: float64(monthlyLeft)},
+			{Key: "benefit_monthly_total", Label: "每月额度", Value: float64(balance.MonthlyTokenLimit)},
 		},
 	}, nil
 }
@@ -687,8 +726,8 @@ func creditQuota(info *accountInfo) (*pluginapi.QuotaFetchResponse, bool) {
 			TierID:   core.FirstNonEmpty(info.Package.SpecCode, "credit"),
 		},
 		Summary: []pluginapi.QuotaMetric{
-			{Key: "total", Label: "积分总额", Value: totalAmount},
 			{Key: "remaining", Label: "剩余积分", Value: totalRemain},
+			{Key: "total", Label: "积分总额", Value: totalAmount},
 			{Key: "used", Label: "已用积分", Value: totalUsed},
 		},
 	}
@@ -711,9 +750,12 @@ func noCreditQuota(info *accountInfo) *pluginapi.QuotaFetchResponse {
 	}
 	return &pluginapi.QuotaFetchResponse{
 		Subscription: &pluginapi.QuotaSubscription{Plan: "CodeArts 积分", TierName: tierName, TierID: specCode},
+		// 上游没返回指标时仍要给出 total / remaining / used 三个键：控制台页头（插件 auth.Totals）
+		// 靠它们折算总额，键缺失会让整张卡变成「暂无额度数据」。Label 里保留
+		// 原因说明，用户才知道 0 是「没开通」而不是「查询坏了」。
 		Summary: []pluginapi.QuotaMetric{
-			{Key: "total", Label: "积分总额（上游未返回积分指标）", Value: 0},
 			{Key: "remaining", Label: "剩余积分", Value: 0},
+			{Key: "total", Label: "积分总额（上游未返回积分指标）", Value: 0},
 			{Key: "used", Label: "已用积分", Value: 0},
 		},
 	}
@@ -727,6 +769,7 @@ func noBenefitQuota() *pluginapi.QuotaFetchResponse {
 			TierName: "未开通",
 			TierID:   "benefit",
 		},
+		// 同上：total 键必须在，否则控制台折算不出总额；标签说明原因。
 		Summary: []pluginapi.QuotaMetric{
 			{Key: "total", Label: "每日免费额度（上游未开通福利权益，无可查额度）", Value: 0},
 		},
@@ -760,7 +803,11 @@ func fetchBenefitBalance(ctx context.Context, cred *Credential) (*benefitBalance
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if errRead != nil {
+		// 半截 body 不能当完整响应交给解析层：网络问题会被误报成业务错误。
+		return nil, fmt.Errorf("read benefit balance response: %w", errRead)
+	}
 	if resp.StatusCode >= 400 {
 		return nil, Classify(resp.StatusCode, string(body))
 	}
@@ -778,8 +825,9 @@ func fetchBenefitBalance(ctx context.Context, cred *Credential) (*benefitBalance
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		return nil, fmt.Errorf("decode benefit balance: %w", err)
 	}
-	// 0000 是成功码；4004 是「没有福利记录」，两者都不是错误退出。
-	if envelope.ErrorCode == "4004" || strings.Contains(envelope.ErrorMsg, "benefit not found") {
+	// 0000 是成功码；4004 是「没有福利记录」，4000 是「通道已关闭」，三者都不是错误退出。
+	if envelope.ErrorCode == "4004" || strings.Contains(envelope.ErrorMsg, "benefit not found") ||
+		envelope.ErrorCode == "4000" || strings.Contains(envelope.ErrorMsg, "invalid channel") {
 		return nil, nil
 	}
 	if envelope.ErrorCode != "" && envelope.ErrorCode != "0000" {

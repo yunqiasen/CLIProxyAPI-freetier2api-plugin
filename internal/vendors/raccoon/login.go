@@ -23,17 +23,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
 )
-
-// loginAuthorizePath 是官方授权页路径。
-const loginAuthorizePath = "/code/authorize"
 
 // loginAppName 是授权页上报的客户端名（与官方桌面客户端一致）。
 const loginAppName = "办公小浣熊客户端"
@@ -86,8 +85,8 @@ func CheckLoginSession(logins core.LoginSessions, sessionID string) (*PendingLog
 }
 
 // pendingMessage 是轮询等待时的进度文案（告诉用户下一步做什么）。
-const pendingMessage = "等待用户在授权页完成登录…登录成功后浏览器会跳转 office-raccoon:// 开头的链接，" +
-	"请把地址栏里的整条链接复制回控制台完成登录"
+const pendingMessage = "等待用户在授权页完成登录…确认授权后浏览器会跳回本机 127.0.0.1:37913/auth/callback；" +
+	"插件与浏览器同机时自动完成，不同机时把浏览器地址栏里的整条链接复制回控制台即可"
 
 // CheckCallbackState 校验回调链接里的 state 与当前会话一致（逐字比对）。
 func CheckCallbackState(session *PendingLogin, callbackState string) bool {
@@ -186,9 +185,13 @@ func ParseCallbackCode(raw string) (code, state string, ok bool) {
 	if errParse != nil {
 		return "", "", false
 	}
-	if !strings.EqualFold(parsed.Scheme, loginCallbackScheme) ||
-		!strings.EqualFold(parsed.Host, loginCallbackHost) ||
-		parsed.Path != loginCallbackPath {
+	deepLink := strings.EqualFold(parsed.Scheme, loginCallbackScheme) &&
+		strings.EqualFold(parsed.Host, loginCallbackHost) &&
+		parsed.Path == loginCallbackPath
+	loopback := parsed.Scheme == "http" &&
+		(parsed.Hostname() == "127.0.0.1" || strings.EqualFold(parsed.Hostname(), "localhost")) &&
+		parsed.Path == CallbackPath
+	if !deepLink && !loopback {
 		return "", "", false
 	}
 	query := parsed.Query()
@@ -199,15 +202,126 @@ func ParseCallbackCode(raw string) (code, state string, ok bool) {
 	return code, query.Get("state"), code != ""
 }
 
-// AuthorizeURLWith 构造官方授权页 URL（panel 的 AuthorizeURL 口径：
-// login_source=desktop & client=desktop & app_name=<中文客户端名>）。
+// AuthorizeURLWith 构造官方授权页 URL。
+//
+// 参数名必须与官方桌面客户端逐字一致：login_source=desktop & appname=<中文
+// 客户端名> & state=<state>。早期实现写的是 app_name（带下划线）并多带一个
+// client=desktop——官方页面认的是 appname，缺了它换票会拿到
+// 「authorization code not found」（200035），表现就是「授权完登录不成功」。
 func AuthorizeURLWith(origin, appName, state string) string {
 	query := url.Values{}
 	query.Set("login_source", "desktop")
-	query.Set("client", "desktop")
-	query.Set("app_name", appName)
+	query.Set("appname", appName)
 	if strings.TrimSpace(state) != "" {
 		query.Set("state", state)
 	}
+	// 走 loopback 回跳：深链 office-raccoon:// 会被官方客户端吃掉，插件拿不到
+	// code。授权页对 desktop_callback=loopback 只放行 127.0.0.1 的 /auth/callback
+	// 且要求 state 是 64 位十六进制（core.RandomHex(32) 正好满足）。
+	query.Set("desktop_callback", "loopback")
+	query.Set("redirect", CallbackURL())
 	return strings.TrimRight(origin, "/") + AuthorizePath + "?" + query.Encode()
+}
+
+// ---- loopback 回调监听 ----
+//
+// 授权页现在只接受两种回跳：office-raccoon:// 深链（会被官方客户端吃掉，
+// 插件永远收不到 code），或 http://127.0.0.1:<port>/auth/callback。
+// 因此登录时在本机起一次性监听，授权页确认后浏览器直接打过来，登录当场完成。
+// 浏览器与插件不同机时回调打不到这里，地址栏仍留着完整链接，粘回控制台走
+// SubmitCallback 兜底，两条路共用 completeLogin。
+
+// CallbackPort 是 loopback 回调端口。授权页只放行 1024-65535，
+// 且 redirect 必须形如 http://127.0.0.1:<port>/auth/callback。
+const CallbackPort = 37913
+
+// CallbackPath 是 loopback 回调路径（授权页硬编码校验，不能改）。
+const CallbackPath = "/auth/callback"
+
+// CallbackURL 返回本机回调地址。
+func CallbackURL() string {
+	return fmt.Sprintf("http://127.0.0.1:%d%s", CallbackPort, CallbackPath)
+}
+
+// catcher 是一次登录期间驻留的回调监听。
+type catcher struct {
+	server  *http.Server
+	state   string
+	onCode  func(code, state string) (string, error)
+	once    sync.Once
+	stopped chan struct{}
+}
+
+var (
+	catcherMu sync.Mutex
+	active    *catcher
+)
+
+// StartCallbackCatcher 为指定 state 启动回调监听。
+//
+// 端口被占、或已有监听在跑时返回 false，调用方据此退回「粘贴链接」流程，
+// 不影响登录本身。
+func StartCallbackCatcher(state string, onCode func(code, state string) (string, error)) bool {
+	catcherMu.Lock()
+	defer catcherMu.Unlock()
+	if active != nil {
+		return false
+	}
+	listener, errListen := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", CallbackPort))
+	if errListen != nil {
+		return false
+	}
+	current := &catcher{state: state, onCode: onCode, stopped: make(chan struct{})}
+	mux := http.NewServeMux()
+	mux.HandleFunc(CallbackPath, current.handle)
+	current.server = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	active = current
+	go func() {
+		_ = current.server.Serve(listener)
+		close(current.stopped)
+	}()
+	return true
+}
+
+// StopCallbackCatcher 结束当前监听（幂等）。
+func StopCallbackCatcher() {
+	catcherMu.Lock()
+	current := active
+	active = nil
+	catcherMu.Unlock()
+	if current == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = current.server.Shutdown(ctx)
+}
+
+func (c *catcher) handle(writer http.ResponseWriter, request *http.Request) {
+	query := request.URL.Query()
+	code := strings.TrimSpace(query.Get("code"))
+	state := strings.TrimSpace(query.Get("state"))
+	if code == "" {
+		writeCallbackPage(writer, http.StatusBadRequest, "回调缺少 code，请回到控制台重新发起登录。")
+		return
+	}
+	message, errComplete := c.onCode(code, state)
+	if errComplete != nil {
+		writeCallbackPage(writer, http.StatusBadRequest, "登录失败："+errComplete.Error())
+		return
+	}
+	writeCallbackPage(writer, http.StatusOK, message)
+	c.once.Do(func() { go StopCallbackCatcher() })
+}
+
+// writeCallbackPage 渲染结果页。只写纯静态文本，不回显任何请求参数。
+func writeCallbackPage(writer http.ResponseWriter, status int, message string) {
+	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
+	writer.WriteHeader(status)
+	_, _ = writer.Write([]byte("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">" +
+		"<title>小浣熊登录</title><style>body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;" +
+		"background:#0f1115;color:#e6e8ee;display:flex;align-items:center;justify-content:center;" +
+		"height:100vh;margin:0}div{text-align:center;line-height:1.8}h1{font-size:18px;font-weight:600}" +
+		"p{color:#9aa3b2;font-size:14px}</style></head><body><div><h1>" + message + "</h1>" +
+		"<p>可以关闭此页面，回到控制台查看账号。</p></div></body></html>"))
 }

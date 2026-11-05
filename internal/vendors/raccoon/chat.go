@@ -41,6 +41,10 @@ const (
 	PointsGrantPath = "/login/points/grant"
 	PointsBillsPath = "/bills"
 	DesktopBasePath = "/api/web/desktop/v1"
+	// OfficeBasePath 是办公域基址（网页端）。setting_info 是它的一个端点，
+	// 服务器在读取时发放当日每日积分（网页端专属，见 DailyGrantViaSetting）。
+	OfficeBasePath  = "/api/web/office/v3"
+	SettingInfoPath = "/setting_info"
 	AuthorizePath   = "/code/authorize"
 	// DefaultConfigName 是上游默认对话模型（v1.1.0 时期抓包的目录
 	// default_model；模型 id 与客户端版本无关，之后未变）。
@@ -113,6 +117,23 @@ func ApplyGrantHeaders(req *http.Request, token, orgCode, deviceID string) {
 	if trimmed := strings.TrimSpace(deviceID); trimmed != "" {
 		req.Header.Set("X-Client-Device-ID", trimmed)
 	}
+	if trimmed := strings.TrimSpace(token); trimmed != "" {
+		req.Header.Set("Authorization", "Bearer "+trimmed)
+	}
+}
+
+// ApplyWebHeaders 写入网页端办公域接口的识别头。
+//
+// 与 ApplyClientHeaders 刻意分开：网页端（SPA）与桌面端的平台枚举不同。
+// 每日积分发放只对网页端生效（服务器在读取 setting_info 时按
+// x-client-platform=web 发放，桌面端的 desktop-windows-x64 不触发），
+// 所以这个域必须用 web，不能用 ApplyClientHeaders。
+func ApplyWebHeaders(req *http.Request, token, orgCode string) {
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Org-Code", strings.TrimSpace(orgCode))
+	req.Header.Set("X-Raccoon-Language", "zh")
+	req.Header.Set("X-Client-Platform", "web")
 	if trimmed := strings.TrimSpace(token); trimmed != "" {
 		req.Header.Set("Authorization", "Bearer "+trimmed)
 	}

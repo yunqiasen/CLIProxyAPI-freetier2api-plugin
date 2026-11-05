@@ -1,6 +1,6 @@
 package app
 
-// freetier2api —— 多供应商免费额度插件。
+// freetier —— 多供应商免费额度插件。
 //
 // 本文件包含插件身份、RPC 方法分发与注册响应。C ABI 在 cgo.go；
 // 供应商注册表由 App 构造，组合根在 vendors.go。
@@ -19,8 +19,8 @@ import (
 const (
 	pluginID          = "freetier2api"
 	pluginDisplayName = "FreeTier 2API"
-	pluginAuthor      = "jiandanc"
-	pluginRepository  = "https://github.com/jiandanc/CLIProxyAPI-freetier2api-plugin"
+	pluginAuthor      = "cxy2730"
+	pluginRepository  = "https://github.com/cxy2730/CLIProxyAPI-freetier2api-plugin"
 
 	providerKey           = core.ProviderKey
 	managementRoutePrefix = "/plugins/" + pluginID
@@ -74,7 +74,12 @@ func (a *App) HandleMethod(method string, request []byte) ([]byte, error) {
 		return a.handleModelForAuth(request)
 
 	case pluginabi.MethodAuthIdentifier:
-		return core.OKEnvelope(identifierResponse{Identifier: providerKey})
+		// 面板「OAuth 登录」列表只渲染 oauth_provider 非空的插件（前端过滤
+		// `!r` 直接跳过），所以这里不发布任何 OAuth 标识：FreeTier 2API 不出现
+		// 在该列表里，登录/添加账号只走插件自己的控制台。
+		// 但必须同时用 credential_providers 认领 auth 文件里的 type=freetier，
+		// 否则宿主的 authProviderEntry 会认不出这些凭证，模型与执行器全部掉线。
+		return core.OKEnvelope(identifierResponse{CredentialProviders: []string{providerKey}})
 	case pluginabi.MethodAuthParse:
 		return a.handleAuthParse(request)
 	case pluginabi.MethodAuthLoginStart:
@@ -117,7 +122,9 @@ func (a *App) HandleMethod(method string, request []byte) ([]byte, error) {
 }
 
 type identifierResponse struct {
-	Identifier string `json:"identifier"`
+	Identifier          string   `json:"identifier"`
+	Identifiers         []string `json:"identifiers,omitempty"`
+	CredentialProviders []string `json:"credential_providers,omitempty"`
 }
 
 func (a *App) handlePluginRegister(request []byte) ([]byte, error) {
@@ -132,14 +139,14 @@ func (a *App) handlePluginRegister(request []byte) ([]byte, error) {
 		return nil, fmt.Errorf("plugin.register: %w", errApply)
 	}
 	if _, errState := a.loadState(cfg); errState != nil {
-		logger.Error("load state failed: %v", errState)
+		logger.Error("加载状态失败：%v", errState)
 	}
 	a.applyModelCatalog(cfg)
 	if !a.registered {
 		a.registered = true
 		a.StartBackgroundWork()
 	}
-	logger.Info("registered: realms=%v state_dir=%s", cfg.EnabledRealms, cfg.StateDir)
+	logger.Info("已注册：区域=%v 状态目录=%s", cfg.EnabledRealms, cfg.StateDir)
 	return core.OKEnvelope(a.Registration())
 }
 
@@ -157,7 +164,7 @@ func (a *App) handlePluginReconfigure(request []byte) ([]byte, error) {
 	}
 	if previous.StateDir != cfg.StateDir {
 		if _, errState := a.loadState(cfg); errState != nil {
-			logger.Error("reload state failed: %v", errState)
+			logger.Error("重新加载状态失败：%v", errState)
 		}
 	}
 	a.applyModelCatalog(cfg)
@@ -165,7 +172,7 @@ func (a *App) handlePluginReconfigure(request []byte) ([]byte, error) {
 	if a.registered {
 		a.StartBackgroundWork()
 	}
-	logger.Info("reconfigured: realms=%v state_dir=%s", cfg.EnabledRealms, cfg.StateDir)
+	logger.Info("已重新配置：区域=%v 状态目录=%s", cfg.EnabledRealms, cfg.StateDir)
 	return core.OKEnvelope(a.Registration())
 }
 
@@ -218,12 +225,8 @@ func (a *App) configFields() []pluginapi.ConfigField {
 		{Name: "extra_models", Type: pluginapi.ConfigFieldTypeString, Description: "额外注册的模型名（不含前缀），逗号分隔。"},
 		{Name: "disabled_models", Type: pluginapi.ConfigFieldTypeString, Description: "禁用的模型列表。"},
 		{Name: "state_dir", Type: pluginapi.ConfigFieldTypeString, Description: "插件状态目录。"},
-		{Name: "log_level", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"debug", "info", "error"}, Description: "插件日志级别。"},
-		{Name: "log_to_file", Type: pluginapi.ConfigFieldTypeBoolean, Description: "是否把日志写入 <state_dir>/logs。"},
 		{Name: "auto_checkin", Type: pluginapi.ConfigFieldTypeBoolean, Description: "是否每日自动签到。"},
-		{Name: "auto_checkin_at", Type: pluginapi.ConfigFieldTypeString, Description: "自动签到时间（HH:MM）。"},
 		{Name: "auto_tasks", Type: pluginapi.ConfigFieldTypeBoolean, Description: "是否每日自动跑任务闭环。"},
-		{Name: "checkin_history_limit", Type: pluginapi.ConfigFieldTypeInteger, Description: "每个账号保留的签到历史条数，默认 30。"},
 	}
 	for _, vendor := range a.registry.Vendors() {
 		if provider, ok := core.As[core.ConfigFieldsProvider](vendor); ok {

@@ -91,7 +91,7 @@ func (s *Service) Registration() pluginapi.ManagementRegistrationResponse {
 		Resources: []pluginapi.ResourceRoute{{
 			Path:        "/console",
 			Menu:        id.DisplayName,
-			Description: "FreeTier 账号、任务与额度管理页。",
+			Description: "FreeTier 账号、额度与模型管理页。",
 		}},
 	}
 }
@@ -112,7 +112,7 @@ func (s *Service) managementRoutes(prefix string) []pluginapi.ManagementRoute {
 		{Method: "POST", Path: prefix + "/models/alias", Description: "给模型设置/清除对外别名（跨供应商同名可合并路由）。"},
 		{Method: "POST", Path: prefix + "/models/refresh", Description: "从上游拉取模型清单并缓存。"},
 		{Method: "GET", Path: prefix + "/logs", Description: "读取插件日志（增量）。"},
-		{Method: "POST", Path: prefix + "/settings", Description: "更新插件运行期设置（自动签到、任务排程、提示词）。"},
+		{Method: "POST", Path: prefix + "/settings", Description: "更新插件运行期设置（每日自动签到、任务排程、模型渠道标识）。"},
 		{Method: "POST", Path: prefix + "/tasks/scan", Description: "扫描全部账号的待办任务。"},
 		{Method: "POST", Path: prefix + "/tasks/run", Description: "执行任务队列（账号内串行、账号间并发）。"},
 		{Method: "GET", Path: prefix + "/tasks/queue", Description: "查询任务队列进度。"},
@@ -120,6 +120,8 @@ func (s *Service) managementRoutes(prefix string) []pluginapi.ManagementRoute {
 		{Method: "POST", Path: prefix + "/tasks/auto_all", Description: "在后台对全部账号依次执行一键完成，立即返回任务编号。"},
 		{Method: "GET", Path: prefix + "/tasks/auto_all/status", Description: "查询后台一键完成的进度与结果。"},
 		{Method: "GET", Path: prefix + "/school/status", Description: "开学季活动状态。"},
+		{Method: "POST", Path: prefix + "/tasks/autoall", Description: "对全部或选中账号执行一键任务（签到 → 成长任务 → 活动领取）。"},
+		{Method: "GET", Path: prefix + "/tasks/autoall/status", Description: "一键任务的进度快照。"},
 		{Method: "POST", Path: prefix + "/keepalive", Description: "手动执行 token 保活。"},
 		{Method: "POST", Path: prefix + "/plans/preview", Description: "查询账号当前可领套餐与人机验证控件参数。"},
 		{Method: "POST", Path: prefix + "/activities/preview", Description: "只读探测账号当前活动资格，不执行领取。"},
@@ -226,8 +228,15 @@ func (s *Service) Handle(request []byte) ([]byte, error) {
 		return core.OKEnvelope(s.handleTasksAutoAll(rpc))
 	case method == http.MethodGet && matchesManagementPath(rpc.Path, id.ID, "/tasks/auto_all/status"):
 		return core.OKEnvelope(s.handleTasksAutoAllStatus(rpc))
+
 	case method == http.MethodGet && matchesManagementPath(rpc.Path, id.ID, "/school/status"):
 		return core.OKEnvelope(s.handleSchoolStatus(rpc))
+
+	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/tasks/autoall"):
+		return core.OKEnvelope(s.handleTasksAutoAllStart(rpc))
+
+	case method == http.MethodGet && matchesManagementPath(rpc.Path, id.ID, "/tasks/autoall/status"):
+		return core.OKEnvelope(s.handleTasksAutoAllStatus(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/plans/preview"):
 		return core.OKEnvelope(s.handlePlansPreview(rpc))
@@ -271,14 +280,6 @@ func matchesManagementPath(path, pluginID, suffix string) bool {
 	return normalized == prefix+suffix || normalized == "/v0/management"+prefix+suffix
 }
 
-func matchesResourcePath(path, pluginID, suffix string) bool {
-	normalized := normalizeRequestPath(path)
-	if !strings.HasPrefix(suffix, "/") {
-		suffix = "/" + suffix
-	}
-	return normalized == "/v0/resource/plugins/"+pluginID+suffix
-}
-
 // managementSuffix 返回去掉前缀后的子路径。
 func managementSuffix(path, pluginID string) (string, bool) {
 	normalized := normalizeRequestPath(path)
@@ -288,6 +289,29 @@ func managementSuffix(path, pluginID string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func matchesResourcePath(path, pluginID, suffix string) bool {
+	normalized := normalizeRequestPath(path)
+	if !strings.HasPrefix(suffix, "/") {
+		suffix = "/" + suffix
+	}
+	return normalized == "/v0/resource/plugins/"+pluginID+suffix
+}
+
+func queryInt64(query map[string][]string, key string, fallback int64) int64 {
+	if query == nil {
+		return fallback
+	}
+	values, okValues := query[key]
+	if !okValues || len(values) == 0 {
+		return fallback
+	}
+	parsed, errParse := strconv.ParseInt(strings.TrimSpace(values[0]), 10, 64)
+	if errParse != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func normalizeRequestPath(path string) string {
@@ -383,21 +407,6 @@ func queryString(query map[string][]string, key string) string {
 		}
 	}
 	return ""
-}
-
-func queryInt64(query map[string][]string, key string, fallback int64) int64 {
-	if query == nil {
-		return fallback
-	}
-	values, okValues := query[key]
-	if !okValues || len(values) == 0 {
-		return fallback
-	}
-	parsed, errParse := strconv.ParseInt(strings.TrimSpace(values[0]), 10, 64)
-	if errParse != nil {
-		return fallback
-	}
-	return parsed
 }
 
 // 供子文件使用的共享助手。

@@ -18,6 +18,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/logger"
@@ -27,8 +28,6 @@ import (
 const (
 	// executorRPCTimeout 是非流式执行的内部上限（流式另有空闲控制）。
 	executorRPCTimeout = 10 * time.Minute
-	// streamEmitTimeout 是单次流分片投递的上限。
-	streamEmitTimeout = 30 * time.Second
 )
 
 // executorRPCRequest 与宿主的 rpcExecutorRequest 对齐。
@@ -161,7 +160,7 @@ func (a *App) runStreamExecution(streamCtx context.Context, cancelStream context
 	errForward := prepared.vendor.ExecuteStream(ctx, prepared.credential, prepared.executeRequest(), sink)
 	// 下游主动断开会取消上下文，那不是错误，不该发错误帧给客户端。
 	if errForward != nil && streamCtx.Err() == nil {
-		closeStream(callbackID, streamID, streamFailureMessage(errForward))
+		closeStreamWithError(callbackID, streamID, errForward)
 		return
 	}
 	closeStream(callbackID, streamID, "")
@@ -356,7 +355,7 @@ func emitStreamChunk(callbackID, streamID string, payload []byte) error {
 		"payload":   payload,
 	})
 	if errCall != nil {
-		logger.Debug("stream emit failed: %v", errCall)
+		logger.Debug("推送流数据失败：%v", errCall)
 	}
 	return errCall
 }
@@ -371,7 +370,59 @@ func closeStream(callbackID, streamID, failure string) {
 		payload["error"] = failure
 	}
 	if _, errCall := hostbridge.Call(callbackID, pluginabi.MethodHostStreamClose, payload); errCall != nil {
-		logger.Debug("stream close failed: %v", errCall)
+		logger.Debug("关闭流失败：%v", errCall)
+	}
+}
+
+// closeStreamWithError 关闭宿主流并带上结构化错误详情。
+//
+// 只发 error 字符串是不够的：宿主把裸文本当成「无状态码的插件错误」，
+// 结果是客户端一律收到 500 internal_server_error，凭证也不会进冷却——
+// 实测被封账号（403 account_fault）与上游限流（429）都因此每 60-90 秒被
+// 重新选中、白打一次上游。error_detail 让状态码、可重试标记与 Retry-After
+// 一起过桥，宿主才能按 conductor_cooldown 的规则处置。
+func closeStreamWithError(callbackID, streamID string, errClose error) {
+	if strings.TrimSpace(streamID) == "" {
+		return
+	}
+	detail := streamErrorDetail(errClose, streamFailureMessage(errClose))
+	message := streamFailureMessage(errClose)
+	if detail != nil {
+		// 结构化错误里的消息已剥掉宿主桥内部前缀，优先用它。
+		message = detail.Message
+	}
+	payload := map[string]any{"stream_id": streamID}
+	if detail != nil {
+		payload["error_detail"] = detail
+	}
+	if message != "" {
+		payload["error"] = message
+	}
+	if _, errCall := hostbridge.Call(callbackID, pluginabi.MethodHostStreamClose, payload); errCall != nil {
+		logger.Debug("关闭流失败：%v", errCall)
+	}
+}
+
+// streamErrorDetail 把供应商错误翻成宿主认的结构化错误。
+//
+// 消息优先用上游原文（诊断价值最高），状态码/可重试/等待秒数来自分类结果；
+// 完全无分类的错误返回 nil，由宿主按旧口径处理（此时 behavior 与修复前一致）。
+func streamErrorDetail(errClose error, message string) *pluginabi.Error {
+	pluginErr, okPlugin := core.ToPluginError(errClose).(*core.PluginError)
+	if !okPlugin || pluginErr == nil {
+		return nil
+	}
+	// 宿主桥的传输错误在原文里带 host.http.do* / host_call_failed 前缀，
+	// 分类结果已经把前缀剥掉并补上状态短语，此时以分类后的消息为准。
+	if strings.TrimSpace(message) == "" || strings.Contains(message, "host_call_failed") || strings.Contains(message, "host.http.do") {
+		message = pluginErr.Message
+	}
+	return &pluginabi.Error{
+		Code:              pluginErr.Code,
+		Message:           message,
+		Retryable:         pluginErr.Retryable,
+		HTTPStatus:        pluginErr.HTTPStatus,
+		RetryAfterSeconds: pluginErr.RetryAfterSeconds,
 	}
 }
 
@@ -413,8 +464,9 @@ func (a *App) handleQuotaFetch(request []byte) ([]byte, error) {
 	ctx := hostbridge.WithCallbackID(context.Background(), "")
 	// 宿主的额度路由**不发 StorageJSON**（只发 AuthIndex/AuthID + 属性），
 	// 因此这里必须能按 index 回源，否则会误报「凭证缺失」。
+	authID := core.FirstNonEmpty(rpc.AuthIndex, rpc.AuthID)
 	credential, vendor, errResolve := a.resolveVendorCredential(ctx, "", rpc.StorageJSON,
-		core.FirstNonEmpty(rpc.AuthIndex, rpc.AuthID), rpc.Attributes)
+		authID, rpc.Attributes)
 	if errResolve != nil {
 		return nil, errResolve
 	}
@@ -423,11 +475,73 @@ func (a *App) handleQuotaFetch(request []byte) ([]byte, error) {
 	if !okQuota {
 		return nil, core.QuotaUnsupported(vendor)
 	}
-	response, errQuota := provider.Quota(ctx, credential)
+	// 与控制台额度面板走同一套重试：401 先保活刷新再重查，传输层故障等待后重查。
+	//
+	// 此前这里直接单发一次 provider.Quota()，于是 MiniMax（access token 只有
+	// 1 小时有效期）在宿主面板上会周期性挂 401，而同一时刻控制台刷新却是好的——
+	// 同一批上游、同一批凭证，两条路径的重试策略不该分裂。
+	response, errQuota := queryVendorQuota(ctx, credential, provider, func() *core.Credential {
+		return a.refreshedQuotaCredential(ctx, "", authID, vendor)
+	})
 	if errQuota != nil {
+		// 宿主契约里没有「这是上次的读数」这种表达（QuotaFetchResponse 不带
+		// stale 字段），所以这里不能拿旧值充新值——那会让宿主面板把过期的
+		// 数字当成实时值展示。要保留上次读数得先在宿主契约里落地这个语义；
+		// 在那之前，如实报错比给一个看不出过期的数字更安全。
+		//
+		// 「失败保留上次读数」只在插件自己的控制台里做（admin 侧有 Stale
+		// 字段，见 internal/admin/quota.go）。
 		return nil, core.ToPluginError(errQuota)
 	}
 	return core.OKEnvelope(response)
+}
+
+// queryVendorQuota 查一次额度：401 先刷新凭证再重查，传输层故障等待后重查。
+//
+// 抽成包级函数是为了让三种结局都能用假 vendor / 假 refresh 测到——换凭证后
+// 重试成功、刷新拿不到新凭证时保留 401、以及无错时只查一次。这三种结局决定
+// 宿主面板显示的是真额度还是错误（#71 第二轮复审 P2-5）。
+func queryVendorQuota(ctx context.Context, credential *core.Credential, provider core.QuotaProvider,
+	refresh func() *core.Credential) (*pluginapi.QuotaFetchResponse, error) {
+	return core.QueryWithRetry(ctx,
+		func(current *core.Credential) (*pluginapi.QuotaFetchResponse, error) {
+			return provider.Quota(ctx, current)
+		},
+		credential,
+		refresh,
+	)
+}
+
+// refreshedQuotaCredential 在额度查询遇到 401 时保活刷新一次凭证。
+//
+// 与控制台 admin.refreshedCredential 同源，实现见 auth.RefreshCredential。
+func (a *App) refreshedQuotaCredential(ctx context.Context, callbackID, authID string, vendor core.Vendor) *core.Credential {
+	if vendor == nil {
+		return nil
+	}
+	credential := auth.RefreshCredential(ctx, a.pool, callbackID, authID, vendor.ID(), a.Config().EnabledRealms,
+		func() {
+			if a.tasks != nil {
+				a.tasks.Keepalive(ctx, callbackID, []string{authID}, 1)
+			}
+		})
+	if credential == nil {
+		return nil
+	}
+	a.adoptRefreshedCredential(authID, credential)
+	return credential
+}
+
+// adoptRefreshedCredential 把刷新后的凭证回写回源缓存。
+//
+// 不回写的代价：宿主额度路由拿新 token 重试这一次是好的，但下一次请求仍走
+// credentialForAuth → 30 秒缓存，于是同一个旧 token 再撞一次 401。
+// 单独抽出来是为了这条不变式能被直接测到，而不必搭一个真实凭证池。
+func (a *App) adoptRefreshedCredential(authID string, credential *core.Credential) {
+	if credential == nil || strings.TrimSpace(authID) == "" {
+		return
+	}
+	a.storeCredential(authID, credential)
 }
 
 // handleQuotaReset 执行一次签到以恢复额度。

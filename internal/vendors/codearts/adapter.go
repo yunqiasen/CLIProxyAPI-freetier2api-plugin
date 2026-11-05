@@ -5,6 +5,7 @@ package codearts
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,6 +69,12 @@ func (v *adapter) fetchModels(ctx context.Context, cred *Credential) ([]Model, e
 	}
 	return parseBuiltinModels(body)
 }
+
+// VetoModelFallback 实现 core.ModelFallbackVeto。
+//
+// 积分通道下这份清单就是「能推哪些模型」的判据，探测失败必须如实返回空：
+// 回落到上次的清单等于继续推广可能已无权限的模型。
+func (v *adapter) VetoModelFallback() bool { return v.creditEnabled.Load() }
 
 // Instances 构造 CodeArts 实例（单一部署，国内区）。
 func Instances(env core.Env) []core.Vendor {
@@ -318,7 +325,12 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 		key = sha256Hex([]byte(native.DomainID + "|" + native.UserID + "|" + native.AccessKeyID))
 	}
 	claimState, _ := v.benefitClaims.LoadOrStore(key, &benefitCheckinState{})
-	result, errClaim := checkin(ctx, native, claimState.(*benefitCheckinState))
+	state, okState := claimState.(*benefitCheckinState)
+	if !okState || state == nil {
+		// 同一张 map 只应存一种类型；兜底而不是直接断言，避免将来复用 map 时 panic。
+		state = &benefitCheckinState{}
+	}
+	result, errClaim := checkin(ctx, native, state)
 	if errClaim != nil {
 		return nil, core.ToPluginError(errClaim)
 	}
@@ -353,6 +365,89 @@ func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*co
 	return SubmitCallback(ctx, v.Env.Logins, state, rawURL)
 }
 
+// AutoTaskCodeOpsBenefit 是一键任务里「活动福利」那一行的任务码。
+const AutoTaskCodeOpsBenefit = "(活动福利)"
+
+// RunAllTasks 执行一键任务：先走签到（积分签到 + 每日登录活动 + 福利通道），
+// 再把活动列表里剩下的可领活动一并领掉。
+//
+// 签到只认每日登录那一条（OpsDailyLoginType），而 EpOpsDelivery 返回的活动
+// 列表里往往还有别的已开放活动；那些活动官方 IDE 有领取按钮，代理此前从不
+// 触碰，等于白丢。这里按 claimable 逐条领取，已领取/已核销的跳过。
+func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core.AutoTaskResult {
+	results := make([]core.AutoTaskResult, 0, 2)
+	if row := core.CheckinAutoTask(ctx, v, cred); row != nil {
+		results = append(results, *row)
+	}
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return append(results, core.AutoTaskResult{Code: AutoTaskCodeOpsBenefit, Status: "error", Message: core.ToPluginError(errNative).Error()})
+	}
+	activities, errFetch := fetchOpsActivities(ctx, native)
+	if errFetch != nil {
+		return append(results, core.AutoTaskResult{Code: AutoTaskCodeOpsBenefit, Status: "error", Message: core.ToPluginError(errFetch).Error()})
+	}
+	var claimed []string
+	var total int64
+	var failed []string
+	for _, activity := range activities {
+		// 每日登录活动已由签到领过，重复领只会拿到「已领取」。
+		if activity.Type == OpsDailyLoginType || !activity.Claimable {
+			continue
+		}
+		if claimedStatuses[strings.ToUpper(activity.Status)] {
+			continue
+		}
+		claim, errClaim := claimOps(ctx, native, activity.CampaignID)
+		if errClaim != nil {
+			failed = append(failed, activity.CampaignID+"："+core.ToPluginError(errClaim).Error())
+			continue
+		}
+		if claim.benefitID != "" {
+			// 与签到一致：需要二次确认的通道补 confirm，失败不推翻已领取的事实。
+			_, _ = signedSnapJSON(ctx, http.MethodPost, SnapEngineApiHost+EpOpsConfirm, native,
+				[]byte(`{"campaignId":"`+jsonEscape(activity.CampaignID)+`"}`))
+		}
+		amount := claim.credit
+		if amount == 0 {
+			amount = activity.Amount
+		}
+		total += amount
+		label := activity.CampaignID
+		if len(label) > 8 {
+			// 活动 id 通常是 ASCII，但上游换过命名；按字符边界切不吃亏。
+			label = core.TrimToBytes(label, 8)
+		}
+		claimed = append(claimed, label+" +"+strconv.FormatInt(amount, 10))
+	}
+	switch {
+	case len(claimed) > 0:
+		message := "领取 " + strconv.Itoa(len(claimed)) + " 个活动，共 +" + strconv.FormatInt(total, 10) + " 积分"
+		if len(failed) > 0 {
+			message += "；失败 " + strconv.Itoa(len(failed)) + " 个：" + strings.Join(failed, " / ")
+		}
+		return append(results, core.AutoTaskResult{Code: AutoTaskCodeOpsBenefit, Status: "done", Message: message})
+	case len(failed) > 0:
+		return append(results, core.AutoTaskResult{Code: AutoTaskCodeOpsBenefit, Status: "error", Message: strings.Join(failed, " / ")})
+	default:
+		return append(results, core.AutoTaskResult{Code: AutoTaskCodeOpsBenefit, Status: "skipped", Message: "没有其它可领活动"})
+	}
+}
+
+// RunTask 执行单条任务。
+func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code string) (core.TaskRunResult, error) {
+	trimmed := strings.TrimSpace(code)
+	if trimmed != core.AutoTaskCodeCheckin && trimmed != AutoTaskCodeOpsBenefit {
+		return core.TaskRunResult{Status: "skipped", Message: "该供应商没有这条任务"}, nil
+	}
+	for _, row := range v.RunAllTasks(ctx, cred) {
+		if row.Code == trimmed {
+			return core.TaskRunResult{Status: row.Status, Message: row.Message, Credit: row.Credit, Energy: row.Energy}, nil
+		}
+	}
+	return core.TaskRunResult{Status: "skipped", Message: "该账号不支持这条任务"}, nil
+}
+
 // 编译期断言：适配器实际具备的供应商能力。
 var (
 	_ core.Vendor               = (*adapter)(nil)
@@ -364,4 +459,5 @@ var (
 	_ core.CreditsProvider      = (*adapter)(nil)
 	_ core.Configurable         = (*adapter)(nil)
 	_ core.ConfigFieldsProvider = (*adapter)(nil)
+	_ core.TaskRunner           = (*adapter)(nil)
 )

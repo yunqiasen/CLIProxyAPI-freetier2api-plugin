@@ -788,11 +788,7 @@ func PathSigFrom(rawURL string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	p := u.Path
-	if strings.HasPrefix(p, "/algo") {
-		p = p[len("/algo"):]
-	}
-	return p, nil
+	return strings.TrimPrefix(u.Path, "/algo"), nil
 }
 
 // shortResponseMaxBytes 是 Qoder 短响应（模型目录、额度、签到、换取 jobToken、
@@ -843,11 +839,9 @@ func (c *BearerClient) callGet(ctx context.Context, fullURL string) (map[string]
 	if resp.StatusCode != 200 {
 		return nil, NewUpstreamError(resp.StatusCode, string(data))
 	}
-	preview := string(data)
-	if len(preview) > 2000 {
-		preview = preview[:2000]
-	}
-	logger.Info("callGet %s response (%d bytes): %s", fullURL, len(data), preview)
+	// 成功响应只记长度：model/list 一次能回 40KB+，原样打 2000 字到 INFO
+	// 会让日志在每次目录刷新时膨胀几 KB，真正有用的错误行被埋掉。
+	logger.Debug("callGet %s 响应（%d 字节）", fullURL, len(data))
 	var result map[string]interface{}
 	err = json.Unmarshal(data, &result)
 	return result, err
@@ -903,7 +897,7 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 				return ctx.Err()
 			}
 			if !core.IsModelProbe(ctx) && IsTransientTransport(err) && attempt < TransientMaxRetries {
-				logger.Info("transient transport error opening stream %s (try %d/%d): %s - retry in %ds",
+				logger.Info("打开流时传输层瞬时错误 %s（第 %d/%d 次）：%s，%d 秒后重试",
 					fullURL, attempt+1, TransientMaxRetries+maxQueueWaits+1, err.Error(), attempt+1)
 				continue
 			}
@@ -922,7 +916,7 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 			if signal, queued := ParseQueueSignal(detail); queued && queueWaits < maxQueueWaits && ctx.Err() == nil {
 				wait := queueWaitFor(signal)
 				queueWaits++
-				logger.Info("upstream queues model %s opening stream %s (%s); waiting %s before retry %d/%d",
+				logger.Info("上游排队模型 %s 打开流 %s（%s），等待 %s 后重试 %d/%d",
 					signal.ModelKey, fullURL, signal.QueueType, wait, queueWaits, maxQueueWaits)
 				if !core.SleepContext(ctx, wait) {
 					return ctx.Err()
@@ -933,7 +927,7 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 				return QueueSignalError(signal)
 			}
 			if IsTransientUpstream(resp.StatusCode, detail) && attempt < TransientMaxRetries {
-				logger.Info("transient upstream HTTP %d opening stream %s (try %d/%d) - retry in %ds",
+				logger.Info("打开流时上游 HTTP %d %s（第 %d/%d 次），%d 秒后重试",
 					resp.StatusCode, fullURL, attempt+1, TransientMaxRetries+maxQueueWaits+1, attempt+1)
 				continue
 			}
@@ -972,7 +966,7 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 			case <-ctx.Done():
 				return ctx.Err()
 			case err := <-errCh:
-				logger.Debug("stream read complete")
+				logger.Debug("流读取完成")
 				return err
 			case line := <-lineCh:
 				if line != "" {
@@ -1475,7 +1469,7 @@ func FetchUserInfoWithToken(ctx context.Context, token string, region Region) (m
 	}
 	// DEBUG 用途排查原始 userinfo 响应结构：降为 Debug 级并截断至 500 字节，
 	// 默认日志级别不再落盘用户名/组织等 PII，保留低级别排查能力
-	logger.Debug("userinfo raw (%d bytes): %s", len(raw), core.Truncate(string(raw), 500))
+	logger.Debug("用户信息原文（%d 字节）：%s", len(raw), core.Truncate(string(raw), 500))
 	return result, nil
 }
 
@@ -1556,13 +1550,13 @@ func NewBridge(ctx context.Context, pat string, region Region, templateBase map[
 		}
 	}
 
-	logger.Info("Bridge session for %s (%s)", name, id)
+	logger.Info("桥接会话：%s（%s）", name, id)
 	// 稳定设备指纹：优先 uid 派生（双区统一、重启不变），uid 缺失退回凭证种子
 	seed := FingerprintSeed(id, pat)
 	mid := DeriveMachineID(seed)
 	mtoken := DeriveMachineToken(seed)
 	mtype := DeriveMachineType(seed)
-	logger.Info("Bridge fingerprint machineid=%s (stable derive)", mid)
+	logger.Info("桥接指纹 machineid=%s（稳定派生）", mid)
 	sess, err := NewSession(identity, mid, mtoken, mtype)
 	if err != nil {
 		return nil, err
@@ -1591,7 +1585,7 @@ func (b *Bridge) ListAvailableModels(ctx context.Context) ([]Model, error) {
 	for k := range resp {
 		keys = append(keys, k)
 	}
-	logger.Info("model list response keys: %v (region=%s)", keys, b.region)
+	logger.Info("模型列表响应字段：%v（区域=%s）", keys, b.region)
 	models := parseModels(resp)
 	if len(models) == 0 {
 		return nil, fmt.Errorf("%s -> empty model list, keys=%v", modelListURL, keys)
@@ -1726,7 +1720,7 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 	originalModel := model
 	model = b.resolveModel(agent, model)
 	if model != originalModel {
-		logger.Debug("mapModel %s/%s -> %s", agent, originalModel, model)
+		logger.Debug("模型映射 %s/%s → %s", agent, originalModel, model)
 	}
 	body := DeepCopyMap(b.templateBase)
 
@@ -1818,8 +1812,8 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 	if len(preview) > 80 {
 		preview = preview[:80] + "..."
 	}
-	logger.Info("callQoder model=%s prompt=%s", model, preview)
-	logger.Debug("callQoder request body: %s", func() string { d, _ := json.Marshal(body); return string(d) }())
+	logger.Info("callQoder 模型=%s 提示词=%s", model, preview)
+	logger.Debug("callQoder 请求体：%s", func() string { d, _ := json.Marshal(body); return string(d) }())
 
 	// ---- SSE 信封重试闸门（第 3 步，参照 hub should_retry_envelope /
 	// aggregate_with_envelope_retry）------------------------------------------
@@ -1847,13 +1841,13 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 				}
 				queueWaits++
 				wait = queueWaitFor(signal)
-				logger.Info("upstream queues model %s (%s); waiting %s before reopening (queue wait %d/%d)",
+				logger.Info("上游排队模型 %s（%s），等待 %s 后重开（排队等待 %d/%d）",
 					signal.ModelKey, signal.QueueType, wait, queueWaits, maxQueueWaits)
 			}
 			if !core.SleepContext(ctx, wait) {
 				return lastErr
 			}
-			logger.Info("reopen upstream after in-stream error (try %d/%d): %v",
+			logger.Info("流内出错后重开上游（第 %d/%d 次）：%v",
 				attempt+1, TransientMaxRetries+maxQueueWaits+1, lastErr)
 		}
 		emitted := false
@@ -1908,42 +1902,6 @@ func isRetryableStreamError(err error) bool {
 		return IsTransientUpstream(ue.Status, ue.Detail)
 	}
 	return IsTransientTransport(err)
-}
-
-// sensitiveFieldNames 命中后其字符串子值会被脱敏（递归进数组/对象继续处理）
-var sensitiveFieldNames = map[string]bool{
-	"content":      true,
-	"text":         true,
-	"system":       true,
-	"input":        true,
-	"instructions": true,
-	"prompt":       true,
-	"description":  true,
-}
-
-func redactValue(v interface{}, parentField string) {
-	switch x := v.(type) {
-	case map[string]interface{}:
-		for k, child := range x {
-			if s, ok := child.(string); ok {
-				if (sensitiveFieldNames[k] || sensitiveFieldNames[parentField]) && len(s) > 32 {
-					x[k] = fmt.Sprintf("<redacted len=%d>", len(s))
-				}
-				continue
-			}
-			redactValue(child, k)
-		}
-	case []interface{}:
-		for i, item := range x {
-			if s, ok := item.(string); ok {
-				if sensitiveFieldNames[parentField] && len(s) > 32 {
-					x[i] = fmt.Sprintf("<redacted len=%d>", len(s))
-				}
-				continue
-			}
-			redactValue(item, parentField)
-		}
-	}
 }
 
 func StrVal(m map[string]interface{}, key string) string {

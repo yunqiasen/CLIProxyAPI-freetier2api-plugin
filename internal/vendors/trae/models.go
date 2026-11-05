@@ -115,12 +115,20 @@ func catalogEntries(items []catalogItem) (map[string]ResolvedModel, map[string]M
 		if display == "" {
 			display = name
 		}
+		contextWindow := item.ContextWindow.Dev
+		if strings.HasSuffix(strings.ToLower(wire), "__max") {
+			if item.ContextWindow.Max > 0 {
+				contextWindow = item.ContextWindow.Max
+			} else {
+				contextWindow = 1000000
+			}
+		}
 		models[strings.ToLower(name)] = ResolvedModel{ConfigName: name, WireName: wire}
 		metadata[name] = Model{
 			ID:            name,
 			Name:          display,
 			Description:   "Trae 上游模型",
-			ContextWindow: item.ContextWindow.Dev,
+			ContextWindow: contextWindow,
 			MaxTokens:     maxTokens,
 			SupportsTools: strings.Contains(item.ExtraConfig, `"native_function_call":true`),
 			IsReasoning:   item.DisplayConfig.ModelCapability == "reasoning_model",
@@ -180,6 +188,7 @@ type catalogItem struct {
 	CustomModels  any    `json:"custom_models"`
 	ContextWindow struct {
 		Dev int `json:"dev"`
+		Max int `json:"max"`
 	} `json:"context_window_tokens"`
 	DisplayConfig struct {
 		DisplayName     string `json:"display_name"`
@@ -225,10 +234,12 @@ type catalogDetail struct {
 	MaxTokens int    `json:"max_tokens"`
 }
 
-// selectWireModel 从 model_detail_list 里挑 wire id：优先 __dev 档位，
-// 没有 __dev 的配置取第一条。注意 wire id 属于某个 function 的命名空间，
+// selectWireModel 从 model_detail_list 里挑 wire id：优先 __max 档位（1M 上下文 / 64K 输出），
+// 没有 __max 时降级到 __dev 档位，再没有则取第一条可用配置。注意 wire id 属于某个 function 的命名空间，
 // 返回值只在该 function 下有效（见 fetchCatalog）。
 func selectWireModel(details []catalogDetail) (string, int) {
+	devWire := ""
+	devTokens := 0
 	fallback := ""
 	fallbackTokens := 0
 	for _, detail := range details {
@@ -236,13 +247,21 @@ func selectWireModel(details []catalogDetail) (string, int) {
 		if name == "" {
 			continue
 		}
-		if strings.HasSuffix(strings.ToLower(name), "__dev") {
+		lower := strings.ToLower(name)
+		if strings.HasSuffix(lower, "__max") {
 			return name, detail.MaxTokens
+		}
+		if strings.HasSuffix(lower, "__dev") && devWire == "" {
+			devWire = name
+			devTokens = detail.MaxTokens
 		}
 		if fallback == "" {
 			fallback = name
 			fallbackTokens = detail.MaxTokens
 		}
+	}
+	if devWire != "" {
+		return devWire, devTokens
 	}
 	return fallback, fallbackTokens
 }
@@ -298,22 +317,22 @@ func fetchCatalog(ctx context.Context, cred *Credential, cfg Config) (catalogEnt
 	client := hostbridge.Client(ctx, 15*time.Second)
 	resp, errDo := client.Do(req)
 	if errDo != nil {
-		logger.Info("trae catalog: %s request failed: %v", cfg.VendorID, errDo)
+		logger.Info("trae 目录：%s 请求失败：%v", cfg.VendorID, errDo)
 		return catalogEntry{}, false
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if resp.StatusCode != http.StatusOK {
-		logger.Info("trae catalog: %s status=%d body=%s", cfg.VendorID, resp.StatusCode, core.Truncate(string(raw), 512))
+		logger.Info("trae 目录：%s 状态=%d 响应体=%s", cfg.VendorID, resp.StatusCode, core.Truncate(string(raw), 512))
 		return catalogEntry{}, false
 	}
 	if errRead != nil {
-		logger.Info("trae catalog: %s read body failed: %v", cfg.VendorID, errRead)
+		logger.Info("trae 目录：%s 读取响应体失败：%v", cfg.VendorID, errRead)
 		return catalogEntry{}, false
 	}
 	var parsed catalogResponse
 	if errJSON := json.Unmarshal(raw, &parsed); errJSON != nil {
-		logger.Info("trae catalog: %s decode failed: %v body=%s", cfg.VendorID, errJSON, core.Truncate(string(raw), 512))
+		logger.Info("trae 目录：%s 解析失败：%v 响应体=%s", cfg.VendorID, errJSON, core.Truncate(string(raw), 512))
 		return catalogEntry{}, false
 	}
 
@@ -322,7 +341,7 @@ func fetchCatalog(ctx context.Context, cred *Credential, cfg Config) (catalogEnt
 	if len(entry.models) == 0 {
 		// 上游偶尔会整体降级（例如构建号低于门控时只回旧清单）。把条目摘要
 		// 打出来，才能区分「目录结构变了」和「版本号被降级」。
-		logger.Info("trae catalog: %s 过滤后为空（function=%s code=%s，原始 %d 条）: %s",
+		logger.Info("trae 目录：%s 过滤后为空（function=%s code=%s，原始 %d 条）：%s",
 			cfg.VendorID, cfg.Function, cfg.IDEVersionCode, len(parsed.ConfigInfoList),
 			summarizeCatalog(parsed.ConfigInfoList))
 		return catalogEntry{}, false
@@ -367,12 +386,28 @@ func consumptionRate(raw json.RawMessage) string {
 }
 
 // decodeObject 把 JSON 解成键值对表；空值/非对象返回 false。
+//
+// 上游会把内层对象序列化成字符串再下发（display_contact_config 由 object
+// 变成 "\u007b\"...\"\u007d" 这种形态）。按对象直解必然失败，而这条链上
+// 没有别的地方报错，表现为整张表的倍率静默变空。这里对字符串形态补一次
+// 二次解析：内容仍是对象就照常返回，仍是普通文本则按非对象处理。
 func decodeObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, false
 	}
 	var doc map[string]json.RawMessage
-	if errDoc := json.Unmarshal(raw, &doc); errDoc != nil || doc == nil {
+	if errDoc := json.Unmarshal(raw, &doc); errDoc == nil && doc != nil {
+		return doc, true
+	}
+	var text string
+	if errText := json.Unmarshal(raw, &text); errText != nil {
+		return nil, false
+	}
+	text = strings.TrimSpace(text)
+	if text == "" || text == "null" {
+		return nil, false
+	}
+	if errDoc := json.Unmarshal([]byte(text), &doc); errDoc != nil || doc == nil {
 		return nil, false
 	}
 	return doc, true

@@ -47,7 +47,8 @@ func probeFixture(t *testing.T, execute func(pluginapi.HostModelExecutionRequest
 
 func callProbe(t *testing.T, s *Service, body string) (int, map[string]any) {
 	t.Helper()
-	request, _ := json.Marshal(pluginapi.ManagementRequest{Method: "POST", Path: "/plugins/freetier2api/models/probe", Headers: http.Header{"X-Host-Callback-Id": []string{"callback-fixture"}}, Body: []byte(body)})
+	path := "/plugins/" + s.deps.Identity().ID + "/models/probe"
+	request, _ := json.Marshal(pluginapi.ManagementRequest{Method: "POST", Path: path, Headers: http.Header{"X-Host-Callback-Id": []string{"callback-fixture"}}, Body: []byte(body)})
 	raw, err := s.Handle(request)
 	if err != nil {
 		t.Fatal(err)

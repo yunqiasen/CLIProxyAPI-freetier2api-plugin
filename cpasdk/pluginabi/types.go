@@ -127,6 +127,12 @@ type Error struct {
 	HTTPStatus int `json:"http_status,omitempty"`
 	// RequestStop ends the diagnostic request without replay.
 	RequestStop bool `json:"request_stop,omitempty"`
+
+	// RetryAfterSeconds carries upstream retry guidance for cooldown and response headers.
+	// It is an optional hint: older hosts silently ignore it, so plugins must not depend
+	// on it for correctness. The same pair is accepted as error_detail on
+	// host.stream.emit and host.stream.close.
+	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
 }
 
 // Error implements the error interface for Error.

@@ -21,6 +21,11 @@ func TestConsumptionRateParsesVariants(t *testing.T) {
 		{"zero is legal", `{"consumption_rate":{"data":{"rate":0}}}`, "0"},
 		{"disabled at rate", `{"consumption_rate":{"enable":false,"data":{"rate":0.9}}}`, ""},
 		{"disabled at data", `{"consumption_rate":{"data":{"enable":false,"rate":0.9}}}`, ""},
+		// 上游会把内层对象序列化成字符串再下发：整条倍率链不能因此静默变空。
+		{"rate as string", `{"consumption_rate":"{\"enable\":true,\"data\":{\"rate\":0.94}}"}`, "0.94"},
+		{"data as string", `{"consumption_rate":{"enable":true,"data":"{\"rate\":0.88}"}}`, "0.88"},
+		{"plain text", `{"consumption_rate":"n/a"}`, ""},
+		{"empty string", `{"consumption_rate":""}`, ""},
 		{"missing", `{}`, ""},
 		{"null", ``, ""},
 	}
@@ -94,5 +99,35 @@ func TestCatalogEntriesParsesCamelCaseOuter(t *testing.T) {
 	}
 	if legacy.SupportsTools {
 		t.Fatal("native_function_call=false 不应声明工具能力")
+	}
+}
+
+// TestSelectWireModelPrefersMaxOverDev 锁定 1M 上下文与 64K 输出档位优先。
+// 当同时存在 __max 与 __dev 时，优先选取 __max 并将 ContextWindow 提升到 1,000,000。
+func TestSelectWireModelPrefersMaxOverDev(t *testing.T) {
+	const body = `{"config_info_list":[
+	 {"config_name":"glm-5.3","config_switch":true,"usage":"chat_completion",
+	  "context_window_tokens":{"dev":116000,"max":1000000},
+	  "display_config":{"display_name":"GLM-5.3","model_capability":"reasoning_model"},
+	  "extra_config":"{\"native_function_call\":true}",
+	  "model_detail_list":[
+	    {"model_name":"glm-5.3__dev","max_tokens":16000},
+	    {"model_name":"glm-5.3__max","max_tokens":64000}
+	  ]}]}`
+
+	var parsed catalogResponse
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	wireModels, metadata := catalogEntries(parsed.ConfigInfoList)
+	if got := wireModels["glm-5.3"].WireName; got != "glm-5.3__max" {
+		t.Fatalf("wire = %q, want glm-5.3__max", got)
+	}
+	model := metadata["glm-5.3"]
+	if model.ContextWindow != 1000000 {
+		t.Fatalf("ContextWindow = %d, want 1000000", model.ContextWindow)
+	}
+	if model.MaxTokens != 64000 {
+		t.Fatalf("MaxTokens = %d, want 64000", model.MaxTokens)
 	}
 }

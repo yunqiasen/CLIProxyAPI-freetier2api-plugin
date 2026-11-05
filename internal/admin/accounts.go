@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
@@ -53,6 +54,21 @@ func (s *Service) buildStatusPayload(req pluginapi.ManagementRequest) map[string
 	}
 }
 
+// checkinFlags 从签到记录推出「今天已确认」与「今天待复核」。
+//
+// LastDate 与 ProvisionalDate 都只写不清（见 tasks/checkin.go），所以两者
+// 都必须与 today 比对，不能只看非空：历史上页面就是只看非空，导致凡是签过
+// 到的账号都判定不出「今天待复核」（#71 第二轮复审 P1-2）。
+func checkinFlags(record *state.CheckinRecord, today string) (confirmed bool, pending bool) {
+	if record == nil || today == "" {
+		return false, false
+	}
+	confirmed = record.LastDate == today
+	// 今天已确认就不算待复核，否则页面会在「今天已签到」的账号上挂黄色标记。
+	pending = record.ProvisionalDate == today && !confirmed
+	return confirmed, pending
+}
+
 // accountSummary 是账号概览条目（不含凭证）。
 type accountSummary struct {
 	AuthID    string `json:"auth_id"`
@@ -71,23 +87,30 @@ type accountSummary struct {
 	NativeLabel string `json:"native_label,omitempty"`
 	// Alias 是用户自定义别名；空表示未设置。页面据此决定是否跳过 API key
 	// 脱敏（别名是用户起的名字，不是凭证）。
-	Alias           string               `json:"alias,omitempty"`
-	VendorID        string               `json:"vendor_id"`
-	VendorName      string               `json:"vendor_name"`
-	Realm           string               `json:"realm"`
-	Status          string               `json:"status"`
-	Disabled        bool                 `json:"disabled"`
-	RefreshedAt     string               `json:"refreshed_at,omitempty"`
-	Checkin         *state.CheckinRecord `json:"checkin,omitempty"`
-	Quota           *quotaResult         `json:"quota,omitempty"`
-	SupportsCheckin bool                 `json:"supports_checkin"`
+	Alias       string               `json:"alias,omitempty"`
+	VendorID    string               `json:"vendor_id"`
+	VendorName  string               `json:"vendor_name"`
+	Realm       string               `json:"realm"`
+	Status      string               `json:"status"`
+	Disabled    bool                 `json:"disabled"`
+	RefreshedAt string               `json:"refreshed_at,omitempty"`
+	Checkin     *state.CheckinRecord `json:"checkin,omitempty"`
+	// CheckinToday 表示「今天已经确认签到成功」（Checkin.LastDate 就是今天）。
+	CheckinToday bool `json:"checkin_today"`
+	// CheckinPending 表示「上游称今天已签到，但还没过可信时刻，需要复核」。
+	//
+	// 这两个结论只能由后端给：LastDate / ProvisionalDate 都只写不清，历史
+	// 账号恒非空，前端拿它们和今天比永远得不出正确结论（#71 第二轮复审 P1-2）。
+	CheckinPending  bool         `json:"checkin_pending"`
+	Quota           *quotaResult `json:"quota,omitempty"`
+	SupportsCheckin bool         `json:"supports_checkin"`
 	// SupportsQuota 是「该供应商能否查出额度」的静态能力，与 Quota（查询结果）
 	// 是两件事：没有结果时它区分「还没查」与「永远查不出来」。
 	SupportsQuota bool `json:"supports_quota"`
 	// Claim 是该账号的套餐领取状态；SupportsClaim 为 false 时前端不渲染入口。
 	Claim         *state.ClaimRecord `json:"claim,omitempty"`
 	SupportsClaim bool               `json:"supports_claim"`
-	// CheckinHistory 是该账号最近的签到执行记录（新→旧，最多 checkin_history_limit 条）。
+	// CheckinHistory 是该账号当天的签到执行记录（新→旧；跨天即清空）。
 	CheckinHistory []state.CheckinHistoryEntry `json:"checkin_history,omitempty"`
 }
 
@@ -129,14 +152,22 @@ func (s *Service) cacheQuotaResult(q quotaResult) {
 	}
 	s.quotaMu.Lock()
 	defer s.quotaMu.Unlock()
+	if s.quotaCache == nil {
+		// 惰性初始化：Service 由 New 构造时已建好，但零值 Service 直接调这里
+		// 会 panic 在 nil map 赋值上。防御成本只是一次 nil 判断，值得。
+		s.quotaCache = map[string]quotaResult{}
+	}
 	s.quotaCache[key] = q
 }
 
 func (s *Service) listAccountSummaries(ctx context.Context, callbackID string) []accountSummary {
 	current := s.deps.State()
+	// today 在循环外取一次：每账号调一次 Today() 会重复格式化时间，且同一批
+	// 账号可能跨零点算出不同的「今天」。
+	today := s.tasks.Today()
 	loaded, failures := s.pool.Load(ctx, callbackID, auth.Options{IncludeDisabled: true})
 	for _, failure := range failures {
-		logger.Debug("skip account %s: %s", core.FirstNonEmpty(failure.Entry.Name, failure.Entry.ID), failure.Message)
+		logger.Debug("跳过账号 %s：%s", core.FirstNonEmpty(failure.Entry.Name, failure.Entry.ID), failure.Message)
 	}
 	out := make([]accountSummary, 0, len(loaded))
 	for _, account := range loaded {
@@ -177,6 +208,14 @@ func (s *Service) listAccountSummaries(ctx context.Context, callbackID string) [
 			summary.Checkin = &record
 		} else if record, okLegacy := lookupLegacyCheckin(current, credential); okLegacy {
 			summary.Checkin = &record
+		}
+		if summary.Checkin != nil {
+			// 「今天是否已确认签到」「今天是否待复核」由后端判定。
+			//
+			// LastDate 只写不清（见 tasks/checkin.go），凡是签过到的账号它恒
+			// 非空，前端拿它和今天比会让待复核标记永远不出现（#71 第二轮复审
+			// P1-2）。判定逻辑抽成 checkinFlags 以便单测。
+			summary.CheckinToday, summary.CheckinPending = checkinFlags(summary.Checkin, today)
 		}
 		summary.CheckinHistory = current.CheckinHistory[state.CheckinHistoryKey(vendor.ID(), uid)]
 		if record, okRecord := current.Claim[uid]; okRecord {
@@ -290,7 +329,7 @@ func (s *Service) handleAccountEnabledRequest(req pluginapi.ManagementRequest) p
 		if body.Enabled {
 			result.Message = "已启用"
 		} else {
-			result.Message = "已禁用"
+			result.Message = "已停用"
 		}
 		changed++
 		results = append(results, result)
@@ -370,7 +409,7 @@ func (s *Service) deleteAuthFile(ctx context.Context, callbackID string, entry c
 		return fmt.Errorf("删除文件失败：%w", errRemove)
 	}
 	s.purgeAccountState(raw, filepath.Base(targetPath))
-	logger.Info("deleted auth file %s (vendor=%s)", filepath.Base(targetPath),
+	logger.Info("已删除授权文件 %s（供应商=%s）", filepath.Base(targetPath),
 		credentialVendorLabel(s.registry, raw, filepath.Base(targetPath)))
 	return nil
 }
@@ -429,7 +468,7 @@ func (s *Service) setAuthDisabled(ctx context.Context, callbackID string, entry 
 	if errSave := saveAuthFile(callbackID, filepath.Base(targetPath), updated); errSave != nil {
 		return errSave
 	}
-	logger.Info("auth file %s disabled=%t (vendor=%s)", filepath.Base(targetPath), disabled,
+	logger.Info("授权文件 %s 停用=%t（供应商=%s）", filepath.Base(targetPath), disabled,
 		credentialVendorLabel(s.registry, raw, filepath.Base(targetPath)))
 	return nil
 }
@@ -511,7 +550,7 @@ func (s *Service) handleAccountAddRequest(req pluginapi.ManagementRequest) plugi
 	if errSave := saveAuthFile(callbackID, fileName, rawJSON); errSave != nil {
 		return JSONResponse(http.StatusInternalServerError, map[string]any{"ok": false, "error": errSave.Error()})
 	}
-	logger.Info("added auth file %s for vendor %s", fileName, vendor.ID())
+	logger.Info("已为供应商 %s 添加授权文件 %s", fileName, vendor.ID())
 	return JSONResponse(http.StatusOK, map[string]any{"ok": true, "auth_id": fileName, "message": "账号保存成功"})
 }
 
@@ -560,7 +599,7 @@ func (s *Service) handleAccountAliasRequest(req pluginapi.ManagementRequest) plu
 		}
 		current.AccountAliases[fileID] = alias
 	})
-	logger.Info("account %s alias: %q", fileID, alias)
+	logger.Info("账号 %s 别名：%q", fileID, alias)
 	return JSONResponse(http.StatusOK, map[string]any{"ok": true, "alias": alias})
 }
 
@@ -638,7 +677,7 @@ func (s *Service) runForAccounts(
 			OK:     false, Message: failure.Message,
 		})
 	}
-	jobResults := auth.RunBatch(loaded, batchConcurrency, func(current auth.Account) accountActionResult {
+	jobResults := runGroupedBatch(ctx, loaded, batchConcurrency, batchAccountGap, func(current auth.Account) accountActionResult {
 		ctx := hostbridge.WithAuthIndex(ctx, current.Entry.AuthIndex)
 		result := accountActionResult{
 			AuthID:   core.FirstNonEmpty(current.Entry.ID, current.Entry.Name),
@@ -664,6 +703,61 @@ func (s *Service) runForAccounts(
 	return append(results, jobResults...)
 }
 
+// batchAccountGap 是同厂商账号之间的间隔。
+//
+// 上游 WAF 看的是同 IP 的突发速率，不看你有几个账号：6 路并发、零间隔的
+// 批量在实测里一次点击就把三个厂商同时打进 429（8 个账号挂掉 7 个）。定时
+// 路径一直是串行 + accountGap，从没出过这个问题——两条路径不该有两套节奏。
+// 跨厂商并发保留，总耗时基本不变，同厂商的峰值降到 1 路。
+const batchAccountGap = 600 * time.Millisecond
+
+// runGroupedBatch 按厂商分组执行动作：组间并发（上限 groups），组内串行并留间隔。
+//
+// 返回值与 accounts 下标对齐，调用方按原顺序呈现即可。
+func runGroupedBatch(
+	ctx context.Context,
+	accounts []auth.Account,
+	groups int,
+	gap time.Duration,
+	run func(auth.Account) accountActionResult,
+) []accountActionResult {
+	if groups < 1 {
+		groups = 1
+	}
+	order := make([]string, 0, 4)
+	byVendor := make(map[string][]int, 4)
+	for index, account := range accounts {
+		vendor := account.Vendor.ID()
+		if _, seen := byVendor[vendor]; !seen {
+			order = append(order, vendor)
+		}
+		byVendor[vendor] = append(byVendor[vendor], index)
+	}
+	results := make([]accountActionResult, len(accounts))
+	limit := make(chan struct{}, groups)
+	var wg sync.WaitGroup
+	for _, vendor := range order {
+		wg.Add(1)
+		go func(indices []int) {
+			defer wg.Done()
+			limit <- struct{}{}
+			defer func() { <-limit }()
+			for position, index := range indices {
+				if position > 0 && !core.SleepContext(ctx, gap) {
+					// ctx 取消后不再往下打上游：剩下的账号只标取消，不发请求。
+					for _, rest := range indices[position:] {
+						results[rest] = accountActionResult{Message: "已取消"}
+					}
+					return
+				}
+				results[index] = run(accounts[index])
+			}
+		}(byVendor[vendor])
+	}
+	wg.Wait()
+	return results
+}
+
 // runWithAuthRetry 在动作因凭证过期（401）失败时，刷新一次凭证再重试。
 //
 // CodeArts 的 STS security token 过期是**可续期**的：不刷新就重试，一键签到
@@ -674,6 +768,6 @@ func runWithAuthRetry(
 	refresh func() *core.Credential,
 	action func(*core.Credential) (accountActionOutcome, error),
 ) (accountActionOutcome, error) {
-	outcome, _, errAction := withAuthRetry(credential, refresh, action)
+	outcome, _, errAction := core.WithAuthRetry(credential, refresh, action)
 	return outcome, errAction
 }

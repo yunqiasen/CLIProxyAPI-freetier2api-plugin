@@ -1,7 +1,6 @@
 package workbuddy
 
 import (
-	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -555,24 +554,12 @@ const (
 	reportGap = 1050 * time.Millisecond
 	// mpActionGap 是小程序任务写动作之间的间隔。
 	mpActionGap = 2 * time.Second
-	// expertSummonGap 是专家召唤链的间隔（实测 8s 成功率最高，取 6s 折中）。
-	expertSummonGap = 6 * time.Second
 	// nightChatGap 是夜间对话之间的间隔。
 	nightChatGap = 4 * time.Second
-	// acceptBatchGap 是批量接受任务的批间间隔。
-	acceptBatchGap = 1050 * time.Millisecond
-	// acceptBatchSize 是批量接受的每批数量。
-	acceptBatchSize = 20
 )
 
 // 异步计分的轮询参数。
 var (
-	// claimPollAttempts 与 claimPollGap 决定普通任务的等待预算（约 12 秒）。
-	claimPollAttempts = 4
-	claimPollGap      = 3 * time.Second
-	// mpPollAttempts / mpPollGap 是小程序任务的等待预算（约 6 秒）。
-	mpPollAttempts = 2
-	mpPollGap      = 3 * time.Second
 	// schoolPollLoops / schoolPollGap 是开学季的等待预算（约 7.5 秒）。
 	schoolPollLoops = 3
 	schoolPollGap   = 2500 * time.Millisecond
@@ -851,22 +838,6 @@ func MiniExpertUseEvent(expertID, expertName, expertType string) []map[string]an
 // SchoolSeasonActivityID 是开学季活动的活动标识（缺它不点亮校园日任务）。
 const SchoolSeasonActivityID = "school_open_day_2026"
 
-// 桌面指纹族请求上下文。
-type desktopContext struct {
-	credential *Credential
-	events     []map[string]any
-}
-
-// run 让事件带上指纹并发出去。
-func (c *desktopContext) run(ctx context.Context, client *Client) error {
-	base := desktopFingerprint(c.credential, client.rt)
-	merged := make([]map[string]any, 0, len(c.events))
-	for _, event := range c.events {
-		merged = append(merged, mergeEvent(base, event))
-	}
-	return client.ReportDesktopEvents(ctx, c.credential, merged)
-}
-
 // ApplyDesktopFingerprint 给事件链注入桌面指纹（导出给 main 包编排使用）。
 func ApplyDesktopFingerprint(credential *Credential, events []map[string]any, rt *runtime) []map[string]any {
 	return withFingerprint(credential, events, rt)
@@ -943,6 +914,32 @@ func NewHexID() string {
 
 func newHexID() string {
 	return NewHexID()
+}
+
+// NewUUIDv7 生成带连字符的标准 UUIDv7（RFC 9562，36 位）。
+//
+// 官方 5.8.4 客户端的 X-Conversation-ID 要求带连字符的标准 UUID 形态。
+func NewUUIDv7() string {
+	var buf [16]byte
+	if _, errRead := rand.Read(buf[:]); errRead != nil {
+		h := core.RandomHex(16)
+		return fmt.Sprintf("%s-%s-%s-%s-%s", h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
+	}
+	ms := time.Now().UnixMilli()
+	buf[0] = byte(ms >> 40)
+	buf[1] = byte(ms >> 32)
+	buf[2] = byte(ms >> 24)
+	buf[3] = byte(ms >> 16)
+	buf[4] = byte(ms >> 8)
+	buf[5] = byte(ms)
+	buf[6] = (buf[6] & 0x0F) | 0x70
+	buf[8] = (buf[8] & 0x3F) | 0x80
+	return fmt.Sprintf("%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+		buf[0], buf[1], buf[2], buf[3],
+		buf[4], buf[5],
+		buf[6], buf[7],
+		buf[8], buf[9],
+		buf[10], buf[11], buf[12], buf[13], buf[14], buf[15])
 }
 
 // NewUUIDv7Hex 生成去横线的 UUIDv7（32 位十六进制）。

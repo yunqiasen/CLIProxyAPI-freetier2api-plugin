@@ -8,14 +8,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/state"
 )
 
-// PluginConfig 是 plugins.configs.freetier2api 解析出的有效全局配置。
+// PluginConfig 是 plugins.configs.freetier 解析出的有效全局配置。
 type PluginConfig struct {
 	// EnabledRealms 是启用的域：逗号分隔的 cn / global 子集。
 	EnabledRealms []string
@@ -29,6 +27,12 @@ type PluginConfig struct {
 	LogLevel string
 	// LogToFile 为 true 时把日志写入 <StateDir>/logs。
 	LogToFile bool
+	// LogToHost 为 true 时把插件日志镜像进宿主日志文件（管理面板可见）。
+	LogToHost bool
+	// HostLogFile 是宿主日志文件路径，空表示按 StateDir 自动探测。
+	HostLogFile string
+	// HostLogLevel 是镜像到宿主日志的最低级别：debug / info / error。
+	HostLogLevel string
 
 	// AutoCheckin 开启每日自动签到。
 	AutoCheckin bool
@@ -36,11 +40,8 @@ type PluginConfig struct {
 	AutoCheckinAt string
 	// AutoTasks 开启成长任务的每日自动闭环。
 	AutoTasks bool
-	// CheckinHistoryLimit 是每个账号保留的签到历史条数（<1 时用默认值）。
-	CheckinHistoryLimit int
-
-	// PromptMode 是提示词过滤模式（全局）：passthrough / custom / append。
-	PromptMode string
+	// AutoRaccoonDailyGrant 开启小浣熊「每日积分」任务（网页端 setting_info）。
+	AutoRaccoonDailyGrant bool
 
 	// ModelNameTag 是模型名的渠道标识模式（全局）：off / prefix / suffix。
 	// 开启后每个供应商的模型对外 ID 自动带上供应商前缀或后缀（如
@@ -56,8 +57,12 @@ const (
 	DefaultLogLevel = "info"
 	// DefaultCheckinAt 是默认签到时间。
 	DefaultCheckinAt = "10:00"
-	// CheckinHistoryLimitKey 是签到历史条数的配置键。
-	CheckinHistoryLimitKey = "checkin_history_limit"
+	// ModelNameTagKey 是模型名渠道标识的全局配置键（off/prefix/suffix）。
+	ModelNameTagKey = "model_name_tag"
+	// ModelNameTagOff / Prefix / Suffix 是模型名渠道标识的三种模式。
+	ModelNameTagOff    = "off"
+	ModelNameTagPrefix = "prefix"
+	ModelNameTagSuffix = "suffix"
 	// DefaultStateDirName 是默认状态目录名。
 	DefaultStateDirName = ".freetier2api-plugin"
 	// StateDirEnvOverride 是状态目录的环境变量覆盖项。
@@ -72,34 +77,7 @@ const (
 	// RealmCN / RealmGlobal 是受支持的域。
 	RealmCN     = "cn"
 	RealmGlobal = "global"
-
-	// PromptModeKey / PromptFileKey 是提示词过滤的全局配置键。
-	//
-	// 提示词过滤是插件级能力：模式与提示词文件全局一份，谁实现过滤谁读这两个
-	// 键（当前是 WorkBuddy），页面不按供应商分别配置。
-	PromptModeKey = "prompt_mode"
-	PromptFileKey = "prompt_file"
-
-	// ModelNameTagKey 是模型名渠道标识的全局配置键（off/prefix/suffix）。
-	ModelNameTagKey = "model_name_tag"
-
-	// PromptModePassThrough / PromptModeCustom / PromptModeAppend 是合法模式。
-	PromptModePassThrough = "passthrough"
-	PromptModeCustom      = "custom"
-	PromptModeAppend      = "append"
-
-	// ModelNameTagOff / Prefix / Suffix 是模型名渠道标识的三种模式。
-	ModelNameTagOff    = "off"
-	ModelNameTagPrefix = "prefix"
-	ModelNameTagSuffix = "suffix"
 )
-
-// deprecatedConfigKeys 是改名后的旧配置键：解析时直接归一化到当前键，
-// 避免老配置被静默忽略（提示词过滤被悄悄关掉比报错更糟）。
-var deprecatedConfigKeys = map[string]string{
-	"workbuddy_prompt_mode": PromptModeKey,
-	"workbuddy_prompt_file": PromptFileKey,
-}
 
 // listValuedConfigKeys 是「允许用 YAML 列表写法」的配置键。
 var listValuedConfigKeys = map[string]bool{
@@ -114,13 +92,16 @@ func DefaultPluginConfig() PluginConfig {
 		EnabledRealms: SplitList(DefaultRealmList),
 		StateDir:      DefaultStateDir(),
 		LogLevel:      DefaultLogLevel,
+		// 宿主日志镜像默认开启：面板日志页只读宿主 main.log，
+		// 不开这个开关插件日志在面板里完全不可见。
+		LogToHost:     true,
+		HostLogLevel:  DefaultLogLevel,
 		AutoCheckin:   true,
 		AutoCheckinAt: DefaultCheckinAt,
 		AutoTasks:     true,
-		// 签到历史条数属于任务设置，默认 30 条/账号。
-		CheckinHistoryLimit: state.DefaultCheckinHistoryLimit,
-
-		PromptMode:   PromptModePassThrough,
+		// 小浣熊每日积分默认开启（网页端 setting_info 触发发放，幂等）。
+		AutoRaccoonDailyGrant: true,
+		// 渠道标识默认关闭：开启会改对外模型 ID，必须由用户显式选择。
 		ModelNameTag: ModelNameTagOff,
 	}
 }
@@ -159,9 +140,6 @@ func DecodePluginConfig(raw []byte, base PluginConfig) (PluginConfig, error) {
 		if !ok {
 			continue
 		}
-		if current, okAlias := deprecatedConfigKeys[key]; okAlias {
-			key = current
-		}
 		if errLine := applyConfigLine(&cfg, key, value); errLine != nil {
 			return cfg, fmt.Errorf("config line %d: %w", lineNo+1, errLine)
 		}
@@ -198,6 +176,16 @@ func applyConfigLine(cfg *PluginConfig, key, value string) error {
 		}
 	case "log_to_file":
 		cfg.LogToFile = ParseBool(value, cfg.LogToFile)
+	case "log_to_host":
+		cfg.LogToHost = ParseBool(value, cfg.LogToHost)
+	case "host_log_file":
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			cfg.HostLogFile = trimmed
+		}
+	case "host_log_level":
+		if trimmed := strings.ToLower(strings.TrimSpace(value)); trimmed != "" {
+			cfg.HostLogLevel = trimmed
+		}
 	case "auto_checkin":
 		cfg.AutoCheckin = ParseBool(value, cfg.AutoCheckin)
 	case "auto_checkin_at":
@@ -206,22 +194,8 @@ func applyConfigLine(cfg *PluginConfig, key, value string) error {
 		}
 	case "auto_tasks":
 		cfg.AutoTasks = ParseBool(value, cfg.AutoTasks)
-	case CheckinHistoryLimitKey:
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			limit, errLimit := strconv.Atoi(trimmed)
-			if errLimit != nil {
-				return fmt.Errorf("%s: %w", CheckinHistoryLimitKey, errLimit)
-			}
-			cfg.CheckinHistoryLimit = limit
-		}
-	case PromptModeKey:
-		mode, errMode := ParsePromptMode(value)
-		if errMode != nil {
-			return errMode
-		}
-		if mode != "" {
-			cfg.PromptMode = mode
-		}
+	case "auto_raccoon_daily_grant":
+		cfg.AutoRaccoonDailyGrant = ParseBool(value, cfg.AutoRaccoonDailyGrant)
 	case ModelNameTagKey:
 		tag, errTag := NormalizeModelNameTag(value)
 		if errTag != nil {
@@ -240,59 +214,25 @@ func ValidatePluginConfig(cfg PluginConfig) error {
 	if _, _, errClock := ParseClock(cfg.AutoCheckinAt); errClock != nil {
 		return fmt.Errorf("auto_checkin_at: %w", errClock)
 	}
-	switch cfg.PromptMode {
-	case PromptModePassThrough, PromptModeCustom, PromptModeAppend:
+	switch cfg.LogLevel {
+	case "debug", "info", "error":
 	default:
-		return fmt.Errorf("prompt_mode %q is not supported (want passthrough, custom or append)", cfg.PromptMode)
+		return fmt.Errorf("log_level %q is not supported (want debug, info or error)", cfg.LogLevel)
+	}
+	switch cfg.HostLogLevel {
+	case "debug", "info", "error":
+	default:
+		return fmt.Errorf("host_log_level %q is not supported (want debug, info or error)", cfg.HostLogLevel)
+	}
+	if strings.TrimSpace(cfg.StateDir) == "" {
+		return fmt.Errorf("state_dir is empty")
 	}
 	switch cfg.ModelNameTag {
 	case ModelNameTagOff, ModelNameTagPrefix, ModelNameTagSuffix:
 	default:
 		return fmt.Errorf("model_name_tag %q is not supported (want off, prefix or suffix)", cfg.ModelNameTag)
 	}
-	switch cfg.LogLevel {
-	case "debug", "info", "error":
-	default:
-		return fmt.Errorf("log_level %q is not supported (want debug, info or error)", cfg.LogLevel)
-	}
-	if strings.TrimSpace(cfg.StateDir) == "" {
-		return fmt.Errorf("state_dir is empty")
-	}
 	return nil
-}
-
-// ParseRealms 解析 realm 列表并去重。
-func ParseRealms(raw string) ([]string, error) {
-	items := SplitList(stripInlineList(raw))
-	out := make([]string, 0, len(items))
-	seen := make(map[string]bool, len(items))
-	for _, item := range items {
-		realm := strings.ToLower(strings.TrimSpace(item))
-		switch realm {
-		case RealmCN, RealmGlobal:
-		default:
-			return nil, fmt.Errorf("enabled_realms contains unsupported realm %q (want cn or global)", item)
-		}
-		if seen[realm] {
-			continue
-		}
-		seen[realm] = true
-		out = append(out, realm)
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("enabled_realms is empty (want a subset of cn,global)")
-	}
-	return out, nil
-}
-
-// ParsePromptMode 解析提示词过滤模式；空串表示未提供（由调用方沿用当前值）。
-func ParsePromptMode(raw string) (string, error) {
-	mode := strings.ToLower(strings.TrimSpace(raw))
-	switch mode {
-	case "", PromptModePassThrough, PromptModeCustom, PromptModeAppend:
-		return mode, nil
-	}
-	return "", fmt.Errorf("prompt_mode %q is not supported (want passthrough, custom or append)", raw)
 }
 
 // NormalizeModelNameTag 归一化渠道标识模式；空串回落 off。
@@ -319,12 +259,28 @@ func EffectiveModelNameTag(cfg PluginConfig, page string) string {
 	return cfg.ModelNameTag
 }
 
-// EffectivePromptMode 返回当前生效的提示词过滤模式：页面覆盖 > YAML > 内置默认。
-func EffectivePromptMode(cfg PluginConfig, page string) string {
-	if mode := strings.ToLower(strings.TrimSpace(page)); mode != "" {
-		return mode
+// ParseRealms 解析 realm 列表并去重。
+func ParseRealms(raw string) ([]string, error) {
+	items := SplitList(stripInlineList(raw))
+	out := make([]string, 0, len(items))
+	seen := make(map[string]bool, len(items))
+	for _, item := range items {
+		realm := strings.ToLower(strings.TrimSpace(item))
+		switch realm {
+		case RealmCN, RealmGlobal:
+		default:
+			return nil, fmt.Errorf("enabled_realms contains unsupported realm %q (want cn or global)", item)
+		}
+		if seen[realm] {
+			continue
+		}
+		seen[realm] = true
+		out = append(out, realm)
 	}
-	return cfg.PromptMode
+	if len(out) == 0 {
+		return nil, fmt.Errorf("enabled_realms is empty (want a subset of cn,global)")
+	}
+	return out, nil
 }
 
 // ParseBool 解析布尔值，无法解析时保留 fallback。

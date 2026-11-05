@@ -8,6 +8,9 @@ package qoder
 
 import (
 	"context"
+	"crypto/sha256"
+	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -15,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"freetier2api-plugin/internal/core"
@@ -289,8 +293,9 @@ func ResolveIdentity(cred *Credential, raw map[string]string, local MachineIdent
 //
 // 身份由官方组件 runtime-info 生成，且与 environment 参数绑定：
 //  1. 主路径：spawn 本机 Qoder 客户端的 runtime-info <env> --account-stdin；
-//  2. 退路：读取客户端缓存的 machine_token.json；
-//  3. 都拿不到时返回零值（不发机器头），由用户手工配置兜底。
+//  2. 次路径：读取客户端缓存的 machine_token.json；
+//  3. 退路：插件内置的官方组件（见本文件末尾「内置官方组件」段），没装客户端也能出身份；
+//  4. 都拿不到时返回零值（不发机器头），由用户手工配置兜底。
 //
 // environment 必须按区域选：官方 asar 里 environment === 'global' ? 3 : 0，
 // 国内版账号配国际版 environment 会拿到另一套身份，活动同样被过滤。
@@ -302,6 +307,9 @@ func LocalMachineIdentity(region Region) MachineIdentity {
 		if identity, okIdentity := readMachineTokenFile(path); okIdentity {
 			return identity
 		}
+	}
+	if identity := embeddedMachineIdentity(region); identity.Native() {
+		return identity
 	}
 	return MachineIdentity{}
 }
@@ -339,16 +347,7 @@ func readRuntimeInfoIdentity(region Region) (MachineIdentity, bool) {
 	if !okExecutable {
 		return MachineIdentity{}, false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), runtimeInfoTimeout)
-	defer cancel()
-
-	command := exec.CommandContext(ctx, executable, runtimeInfoEnvironment(region), "--account-stdin")
-	command.Stdin = strings.NewReader(`{"account":""}`)
-	output, errRun := command.Output()
-	if errRun != nil {
-		return MachineIdentity{}, false
-	}
-	return parseRuntimeInfoOutput(string(output))
+	return runRuntimeInfo(executable, region)
 }
 
 // locateRuntimeInfo 定位本机 runtime-info 可执行文件。
@@ -454,4 +453,115 @@ func readMachineTokenFile(path string) (MachineIdentity, bool) {
 func fileExists(path string) bool {
 	info, errStat := os.Stat(path)
 	return errStat == nil && !info.IsDir()
+}
+
+const (
+	// embeddedIdentityTTL 是内存缓存寿命，比官方 CLI 的 1 小时刷新稍短。
+	embeddedIdentityTTL = 55 * time.Minute
+	// embeddedIdentityDir 是解包目录名，放在用户缓存目录下。
+	embeddedIdentityDir = "freetier"
+)
+
+// embeddedAssets 持有三个平台的官方组件，按当前平台挑一份用。
+//
+//go:embed assets/runtime-info-*
+var embeddedAssets embed.FS
+
+var (
+	embeddedIdentityMu    sync.Mutex
+	embeddedIdentityAt    time.Time
+	embeddedIdentityValue MachineIdentity
+)
+
+// embeddedMachineIdentity 用内置组件生成本机身份；失败返回零值。
+func embeddedMachineIdentity(region Region) MachineIdentity {
+	embeddedIdentityMu.Lock()
+	defer embeddedIdentityMu.Unlock()
+
+	if embeddedIdentityValue.Native() && time.Since(embeddedIdentityAt) < embeddedIdentityTTL {
+		return embeddedIdentityValue
+	}
+	executable, okExtract := extractEmbeddedRuntimeInfo()
+	if !okExtract {
+		return MachineIdentity{}
+	}
+	identity, okRun := runRuntimeInfo(executable, region)
+	if !okRun {
+		return MachineIdentity{}
+	}
+	embeddedIdentityAt, embeddedIdentityValue = time.Now(), identity
+	return identity
+}
+
+// embeddedAssetPath 返回当前平台对应的内置组件名，没有则返回空串。
+func embeddedAssetPath() string {
+	switch runtime.GOOS + "/" + runtime.GOARCH {
+	case "linux/amd64":
+		return "assets/runtime-info-linux-amd64.bin"
+	case "linux/arm64":
+		return "assets/runtime-info-linux-arm64.bin"
+	case "windows/amd64":
+		return "assets/runtime-info-windows-amd64.exe"
+	}
+	return ""
+}
+
+// extractEmbeddedRuntimeInfo 把内置组件解到缓存目录并返回可执行路径。
+//
+// 路径带内容哈希，升级插件时自然换目录，旧目录留着也无害；写入先落临时名再
+// rename，避免半截文件被后续进程当成可执行体。
+func extractEmbeddedRuntimeInfo() (string, bool) {
+	asset := embeddedAssetPath()
+	if asset == "" {
+		return "", false
+	}
+	switch strings.TrimSpace(os.Getenv("QODER_NO_EMBEDDED_RUNTIME_INFO")) {
+	case "1", "true", "yes", "on":
+		return "", false
+	}
+	blob, errRead := embeddedAssets.ReadFile(asset)
+	if errRead != nil || len(blob) == 0 {
+		return "", false
+	}
+	sum := sha256.Sum256(blob)
+	name := "runtime-info"
+	if runtime.GOOS == "windows" {
+		name = "runtime-info.exe"
+	}
+	base, errCache := os.UserCacheDir()
+	if errCache != nil || base == "" {
+		base = os.TempDir()
+	}
+	target := filepath.Join(base, embeddedIdentityDir, "umid-"+hex.EncodeToString(sum[:])[:16], name)
+	if existing, errExisting := os.ReadFile(target); errExisting == nil {
+		if sha256.Sum256(existing) == sum {
+			return target, true
+		}
+	}
+	if errMkdir := os.MkdirAll(filepath.Dir(target), 0o700); errMkdir != nil {
+		return "", false
+	}
+	temp := target + ".tmp"
+	if errWrite := os.WriteFile(temp, blob, 0o700); errWrite != nil {
+		return "", false
+	}
+	if errRename := os.Rename(temp, target); errRename != nil {
+		_ = os.Remove(temp)
+		return "", false
+	}
+	return target, true
+}
+
+// runRuntimeInfo 执行官方组件并解析身份。
+func runRuntimeInfo(executable string, region Region) (MachineIdentity, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeInfoTimeout)
+	defer cancel()
+
+	command := exec.CommandContext(ctx, executable, runtimeInfoEnvironment(region), "--account-stdin")
+	command.Stdin = strings.NewReader(`{"account":""}`)
+	output, errRun := command.Output()
+	if errRun != nil {
+		return MachineIdentity{}, false
+	}
+	return parseRuntimeInfoOutput(string(output))
 }

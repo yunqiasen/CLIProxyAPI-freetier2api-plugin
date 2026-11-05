@@ -78,3 +78,90 @@ func TestClaimDailyGrantAlreadyClaimed(t *testing.T) {
 		t.Fatalf("granted=%v credit=%d, want false/0", granted, credit)
 	}
 }
+
+// TestApplyWebHeadersLocksPlatform 锁住网页端办公域的平台枚举（web，非 desktop）。
+func TestApplyWebHeadersLocksPlatform(t *testing.T) {
+	req, errNew := http.NewRequest(http.MethodGet, "https://example.test", nil)
+	if errNew != nil {
+		t.Fatalf("new request: %v", errNew)
+	}
+	ApplyWebHeaders(req, "tok", "org-1")
+	if got := req.Header.Get("X-Client-Platform"); got != "web" {
+		t.Errorf("X-Client-Platform = %q, want web", got)
+	}
+	if got := req.Header.Get("X-Org-Code"); got != "org-1" {
+		t.Errorf("X-Org-Code = %q, want org-1", got)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer tok" {
+		t.Errorf("Authorization = %q, want Bearer tok", got)
+	}
+}
+
+// TestDailyGrantViaSettingParsesDailyPopup 锁住每日积分来自 setting_info 的
+// point_grant_popups（source=daily 计入，其余来源不计）。
+func TestDailyGrantViaSettingParsesDailyPopup(t *testing.T) {
+	hostbridgetest.UseLoopbackHost(t)
+	var gotPath string
+	var gotPlatform string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotPlatform = r.Header.Get("X-Client-Platform")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"point_grant_popups":[{"source":"daily","points":300,"display_name":"每日积分"},{"source":"monthly","points":1000}]}}`))
+	}))
+	defer server.Close()
+
+	cred := &Credential{AccessToken: "tok"}
+	granted, credit, errGrant := DailyGrantViaSetting(context.Background(), server.URL, cred)
+	if errGrant != nil {
+		t.Fatalf("DailyGrantViaSetting: %v", errGrant)
+	}
+	if !granted || credit != 300 {
+		t.Fatalf("granted=%v credit=%d, want true/300", granted, credit)
+	}
+	if gotPath != "/api/web/office/v3/setting_info" {
+		t.Errorf("path = %q, want /api/web/office/v3/setting_info", gotPath)
+	}
+	if gotPlatform != "web" {
+		t.Errorf("X-Client-Platform = %q, want web", gotPlatform)
+	}
+}
+
+// TestDailyGrantViaSettingOrgPath 锁住组织账号的 office/<org> 路径分支。
+func TestDailyGrantViaSettingOrgPath(t *testing.T) {
+	hostbridgetest.UseLoopbackHost(t)
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		_, _ = w.Write([]byte(`{"code":0,"data":{"point_grant_popups":[]}}`))
+	}))
+	defer server.Close()
+
+	cred := &Credential{AccessToken: "tok", OfficeIdentity: "org-9"}
+	granted, _, errGrant := DailyGrantViaSetting(context.Background(), server.URL, cred)
+	if errGrant != nil {
+		t.Fatalf("DailyGrantViaSetting: %v", errGrant)
+	}
+	if gotPath != "/api/web/office/v3/office/org-9/setting_info" {
+		t.Errorf("path = %q, want /api/web/office/v3/office/org-9/setting_info", gotPath)
+	}
+	if granted {
+		t.Errorf("granted = true, want false（无 daily popup）")
+	}
+}
+
+// TestDailyGrantViaSettingNoPopup 锁住幂等语义：当天已发时不新增 daily popup。
+func TestDailyGrantViaSettingNoPopup(t *testing.T) {
+	hostbridgetest.UseLoopbackHost(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"code":0,"data":{"point_grant_popups":[]}}`))
+	}))
+	defer server.Close()
+
+	granted, credit, errGrant := DailyGrantViaSetting(context.Background(), server.URL, &Credential{AccessToken: "tok"})
+	if errGrant != nil {
+		t.Fatalf("DailyGrantViaSetting: %v", errGrant)
+	}
+	if granted || credit != 0 {
+		t.Fatalf("granted=%v credit=%d, want false/0", granted, credit)
+	}
+}

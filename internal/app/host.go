@@ -29,13 +29,14 @@ func (h *hostBridge) AuthJSON(ctx context.Context, authIndex string) ([]byte, bo
 func (h *hostBridge) Settings() core.Settings {
 	cfg := h.app.Config()
 	return core.Settings{
-		EnabledRealms: append([]string(nil), cfg.EnabledRealms...),
-		StateDir:      cfg.StateDir,
-		MachineSalt:   h.app.machineSalt,
-		AutoCheckin:   cfg.AutoCheckin,
-		AutoCheckinAt: cfg.AutoCheckinAt,
-		AutoTasks:     cfg.AutoTasks,
-		LogLevel:      cfg.LogLevel,
+		EnabledRealms:         append([]string(nil), cfg.EnabledRealms...),
+		StateDir:              cfg.StateDir,
+		MachineSalt:           h.app.machineSalt,
+		AutoCheckin:           cfg.AutoCheckin,
+		AutoCheckinAt:         cfg.AutoCheckinAt,
+		AutoTasks:             cfg.AutoTasks,
+		AutoRaccoonDailyGrant: cfg.AutoRaccoonDailyGrant,
+		LogLevel:              cfg.LogLevel,
 	}
 }
 
@@ -47,7 +48,6 @@ func (a *App) configureVendors(cfg pluginConfig) {
 		raw[key] = value
 	}
 	// 提示词过滤是全局设置：页面覆盖 > YAML > 内置默认，供应商读同一个键。
-	raw[admin.PromptModeKey] = admin.EffectivePromptMode(cfg, a.SnapshotState().PromptMode)
 	for _, vendor := range a.registry.Vendors() {
 		if configurable, okConfigurable := vendor.(core.Configurable); okConfigurable {
 			configurable.Configure(settings, raw)
@@ -145,7 +145,7 @@ func (a *App) WaitPluginStreams(timeout time.Duration) {
 		a.streamMu.Lock()
 		remaining := len(a.streamCancels)
 		a.streamMu.Unlock()
-		logger.Error("shutdown: %d stream task(s) still running after %s", remaining, time.Since(start).Round(time.Millisecond))
+		logger.Error("关闭：等待 %s 后仍有 %d 个流任务在运行", time.Since(start).Round(time.Millisecond), remaining)
 	}
 }
 

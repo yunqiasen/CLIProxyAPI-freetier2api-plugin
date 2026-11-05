@@ -83,6 +83,9 @@ func setupTestPlugin(t *testing.T, mutate ...func(*app.Config)) app.Config {
 	cfg.StateDir = t.TempDir()
 	cfg.LogLevel = "error"
 	cfg.LogToFile = false
+	// 集成用例断言的是「渠道标识开启」时的对外 ID（上游 0.1.33 起恒定前缀）。
+	// 二开版把这个行为做成开关且默认 off，这里显式打开，保持用例语义不变。
+	cfg.ModelNameTag = "prefix"
 	for _, apply := range mutate {
 		apply(&cfg)
 	}
@@ -105,9 +108,6 @@ func setupTestPlugin(t *testing.T, mutate ...func(*app.Config)) app.Config {
 	return cfg
 }
 
-// resetPluginGlobals 保留为空：每个用例创建独立 App，不再需要清全局。
-func resetPluginGlobals(*testing.T) {}
-
 // buildConfigYAML 生成宿主会传给 plugin.register 的配置 YAML。
 //
 // 包含宿主追加的 enabled / priority 两键，验证插件对未知字段的容忍。
@@ -125,16 +125,6 @@ func buildConfigYAML(cfg app.Config) []byte {
 	}
 	fmt.Fprintf(&builder, "auto_checkin_at: %q\n", cfg.AutoCheckinAt)
 	return []byte(builder.String())
-}
-
-// registerRequest 构造 plugin.register 的请求体。
-func registerRequest(t *testing.T, cfg app.Config) []byte {
-	t.Helper()
-	raw, errMarshal := json.Marshal(app.LifecycleRequest{ConfigYAML: buildConfigYAML(cfg)})
-	if errMarshal != nil {
-		t.Fatalf("marshal register request: %v", errMarshal)
-	}
-	return raw
 }
 
 // sampleCredentialJSON 构造一份凭证 JSON（嵌套形态）。

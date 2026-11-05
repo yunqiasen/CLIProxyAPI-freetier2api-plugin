@@ -42,26 +42,10 @@ func TestDecodeValidation(t *testing.T) {
 		"enabled_realms: mars\n",
 		"log_level: verbose\n",
 		"auto_checkin_at: 25:00\n",
-		"prompt_mode: overwrite\n",
-		"model_name_tag: inline\n",
 	} {
 		if _, err := DecodePluginConfig([]byte(raw), DefaultPluginConfig()); err == nil {
 			t.Fatalf("expected error for %q", raw)
 		}
-	}
-}
-
-// TestDeprecatedPromptKeys 验证旧键名仍被解析成全局提示词配置。
-func TestDeprecatedPromptKeys(t *testing.T) {
-	cfg, err := DecodePluginConfig([]byte("workbuddy_prompt_mode: append\nworkbuddy_prompt_file: /tmp/p.md\n"), DefaultPluginConfig())
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if cfg.PromptMode != PromptModeAppend {
-		t.Fatalf("prompt mode = %q", cfg.PromptMode)
-	}
-	if cfg.Raw[PromptFileKey] != "/tmp/p.md" {
-		t.Fatalf("prompt file = %q", cfg.Raw[PromptFileKey])
 	}
 }
 
@@ -84,58 +68,20 @@ func TestDefaultStateDirHonoursEnv(t *testing.T) {
 	}
 }
 
-// TestNormalizeModelNameTag 锁住渠道标识模式的取值集合。
-func TestNormalizeModelNameTag(t *testing.T) {
-	valid := map[string]string{
-		"":          ModelNameTagOff,
-		"off":       ModelNameTagOff,
-		" PREFIX ":  ModelNameTagPrefix,
-		"suffix":    ModelNameTagSuffix,
-		" SUFFIX  ": ModelNameTagSuffix,
-	}
-	for raw, want := range valid {
-		got, err := NormalizeModelNameTag(raw)
-		if err != nil || got != want {
-			t.Errorf("NormalizeModelNameTag(%q) = %q, %v; want %q", raw, got, err, want)
-		}
-	}
-	if _, err := NormalizeModelNameTag("inline"); err == nil {
-		t.Fatal("unsupported tag must be an error")
-	}
-}
-
-// TestDecodeModelNameTag 验证 YAML 键解析与生效优先级：页面覆盖 > YAML > off。
-func TestDecodeModelNameTag(t *testing.T) {
-	cfg, err := DecodePluginConfig([]byte("model_name_tag: Prefix\n"), DefaultPluginConfig())
+func TestDecodeRaccoonDailyGrant(t *testing.T) {
+	cfg, err := DecodePluginConfig([]byte("auto_raccoon_daily_grant: false\n"), DefaultPluginConfig())
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if cfg.ModelNameTag != ModelNameTagPrefix {
-		t.Fatalf("model name tag = %q", cfg.ModelNameTag)
+	if cfg.AutoRaccoonDailyGrant {
+		t.Fatal("auto_raccoon_daily_grant should be false")
 	}
-	if got := EffectiveModelNameTag(cfg, "suffix"); got != ModelNameTagSuffix {
-		t.Fatalf("page override = %q", got)
+	// 默认开启。
+	cfgDefault, errDefault := DecodePluginConfig([]byte(""), DefaultPluginConfig())
+	if errDefault != nil {
+		t.Fatalf("decode default: %v", errDefault)
 	}
-	if got := EffectiveModelNameTag(cfg, " "); got != ModelNameTagPrefix {
-		t.Fatalf("yaml fallback = %q", got)
-	}
-	if got := EffectiveModelNameTag(PluginConfig{}, ""); got != ModelNameTagOff {
-		t.Fatalf("default = %q", got)
-	}
-}
-
-func TestDecodeCheckinHistoryLimit(t *testing.T) {
-	if got := DefaultPluginConfig().CheckinHistoryLimit; got != 30 {
-		t.Fatalf("默认签到历史条数 = %d, 期望 30", got)
-	}
-	cfg, err := DecodePluginConfig([]byte("checkin_history_limit: 7\n"), DefaultPluginConfig())
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if cfg.CheckinHistoryLimit != 7 {
-		t.Fatalf("checkin_history_limit = %d, 期望 7", cfg.CheckinHistoryLimit)
-	}
-	if _, errBad := DecodePluginConfig([]byte("checkin_history_limit: lots\n"), DefaultPluginConfig()); errBad == nil {
-		t.Fatal("非数字的 checkin_history_limit 必须报错，而不是静默回落到默认值")
+	if !cfgDefault.AutoRaccoonDailyGrant {
+		t.Fatal("auto_raccoon_daily_grant default should be true")
 	}
 }

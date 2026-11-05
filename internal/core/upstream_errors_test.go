@@ -1,10 +1,11 @@
 package core
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestToPluginErrorPreservesWrappedMessageAndClassification(t *testing.T) {
@@ -44,46 +45,39 @@ func TestErrorMapping(t *testing.T) {
 	}
 }
 
-func TestToPluginErrorPreservesAlreadyStructuredError(t *testing.T) {
-	original := NewPluginError("upstream_client", `{"code":11158}`, http.StatusBadRequest)
-	converted := ToPluginError(fmt.Errorf("executor: %w", original))
-	coded, ok := converted.(*PluginError)
-	if !ok || coded.HTTPStatus != http.StatusBadRequest {
-		t.Fatalf("lost status: %#v", converted)
-	}
-}
-
-func TestProbeErrorPreservesRawUpstreamDetail(t *testing.T) {
-	upstream := &Failure{Kind: FailureKindClient, Status: 400, Msg: `{"code":11158,"msg":"is not allowed for user type"}`}
-	converted := ToProbeError(upstream).(*PluginError)
-	if converted.Message != upstream.Msg || converted.HTTPStatus != 400 {
-		t.Fatalf("lost upstream detail: %#v", converted)
-	}
-}
-
-func TestProbeErrorEnvelopeStopsAllHostRetries(t *testing.T) {
-	for _, original := range []error{&Failure{Kind: FailureKindTransient, Status: 503, Msg: "server"}, fmt.Errorf("dial tcp: EOF")} {
-		raw := ErrorEnvelopeFromError(ToProbeError(original))
-		var env struct {
-			Error struct {
-				Stop      bool `json:"request_stop"`
-				Retryable bool `json:"retryable"`
-			} `json:"error"`
+// TestTrimToBytesKeepsRuneBoundary 守住字节上限截断不切坏 UTF-8。
+//
+// 上游错误正文多为中文；按字节直切会把最后一个字符劈成半个序列，
+// 日志与面板显示成 U+FFFD。
+func TestTrimToBytesKeepsRuneBoundary(t *testing.T) {
+	body := "签到失败：活动未开启，请稍后再试"
+	for limit := 1; limit <= len(body)+2; limit++ {
+		got := TrimToBytes(body, limit)
+		if len(got) > limit {
+			t.Fatalf("limit=%d 超长: %q", limit, got)
 		}
-		if err := json.Unmarshal(raw, &env); err != nil {
-			t.Fatal(err)
+		if !utf8.ValidString(got) {
+			t.Fatalf("limit=%d 切坏 UTF-8: %q", limit, got)
 		}
-		if !env.Error.Stop || env.Error.Retryable {
-			t.Fatalf("probe may replay: %s", raw)
+		if !strings.HasPrefix(body, got) {
+			t.Fatalf("limit=%d 不是前缀: %q", limit, got)
 		}
 	}
 }
 
-func TestProbePreservesRawDetailThroughAdapterConversion(t *testing.T) {
-	original := &Failure{Kind: FailureKindCredential, Status: 401, Msg: "classified", RawStatus: 403, RawBody: `{"code":810001,"message":"busy"}`}
-	adapterError := ToPluginError(original)
-	probe := ToProbeError(ToPluginError(adapterError)).(*PluginError)
-	if probe.HTTPStatus != 403 || probe.Message != original.RawBody {
-		t.Fatalf("adapter erased diagnostic evidence: %+v", probe)
+// TestTruncateKeepsRuneBoundary 守住 Truncate 的口径：超长才加省略号，且不切坏字符。
+func TestTruncateKeepsRuneBoundary(t *testing.T) {
+	body := "上游返回：额度不足"
+	if got := Truncate(body, 300); got != body {
+		t.Fatalf("未超长不应改动: %q", got)
+	}
+	for limit := 1; limit < len(body); limit++ {
+		got := Truncate(body, limit)
+		if !strings.HasSuffix(got, "...") {
+			t.Fatalf("limit=%d 缺少省略号: %q", limit, got)
+		}
+		if !utf8.ValidString(got) {
+			t.Fatalf("limit=%d 切坏 UTF-8: %q", limit, got)
+		}
 	}
 }

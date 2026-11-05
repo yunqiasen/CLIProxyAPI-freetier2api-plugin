@@ -12,12 +12,12 @@ import (
 )
 
 func TestConsolePageHidesMissingTotal(t *testing.T) {
-	page := Page("/plugins/freetier2api")
+	page := Page("/plugins/freetier")
 
 	for _, literal := range []string{
-		"var hasTotal = quota.total > 0;",
-		"上游只提供可用余额",
-		// 没有总额时总额位必须是占位符而不是数字 0。
+		"var hasTotal = !!quota.has_total;",
+		"有的上游只报可用余额",
+		// 没有总额时总额位必须是占位符而不是数字 0；has_total 由后端给，前端不反推。
 		"quota.remain + \" / \" + (hasTotal ? quota.total : \"\u2014\")",
 	} {
 		if !strings.Contains(page, literal) {
@@ -36,7 +36,7 @@ func TestConsolePageHidesMissingTotal(t *testing.T) {
 // !quota.ok 时只渲染「-- / --」，用户拿到的信息与「上游没有额度接口」没有
 // 区别，无法判断该重新授权还是稍后再查。横幅也只报一个失败计数。
 func TestConsolePageShowsQuotaFailureReason(t *testing.T) {
-	page := Page("/plugins/freetier2api")
+	page := Page("/plugins/freetier")
 
 	for _, literal := range []string{
 		`var reason = quota.message || "额度查询失败";`,
@@ -51,5 +51,26 @@ func TestConsolePageShowsQuotaFailureReason(t *testing.T) {
 		if !strings.Contains(page, literal) {
 			t.Fatalf("console page is missing quota failure rendering (%s)", literal)
 		}
+	}
+}
+
+// TestConsolePageShowsPendingGrant 锁住「已领取、未生效的活动额度」的展示出口。
+//
+// 上游在授予生效前不建额度桶，这部分进不了 remain / total；页面若不单独显示，
+// 用户领到的几亿在账号表上没有任何痕迹，只能以为没到账。
+func TestConsolePageShowsPendingGrant(t *testing.T) {
+	page := Page("/plugins/freetier")
+
+	for _, literal := range []string{
+		`if (metrics[i] && metrics[i].key === "pending") return metrics[i].value;`,
+		`var pendingTag = el("span", " 待生效 " + pending, "muted");`,
+	} {
+		if !strings.Contains(page, literal) {
+			t.Fatalf("console page is missing the pending-grant display (%s)", literal)
+		}
+	}
+	// 待生效额度不得被算进页头的剩余 / 总额。
+	if strings.Contains(page, "quota.remain + pending") {
+		t.Fatal("pending grant must not be added into remain")
 	}
 }

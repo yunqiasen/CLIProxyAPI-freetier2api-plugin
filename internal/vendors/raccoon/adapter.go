@@ -143,7 +143,7 @@ func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]p
 	}
 	models, errModels := FetchModels(ctx, v.resolveLLMBase(), native.AccessTokenValue())
 	if errModels != nil {
-		logger.Info("raccoon: model catalog fallback to static: %v", errModels)
+		logger.Info("raccoon：模型目录回退到静态清单：%v", errModels)
 		models = StaticFallbackModels()
 	}
 	return v.modelsToPluginAPI(models), nil
@@ -239,6 +239,7 @@ func (v *adapter) Quota(ctx context.Context, cred *core.Credential) (*pluginapi.
 	}
 	return &pluginapi.QuotaFetchResponse{
 		Subscription: &pluginapi.QuotaSubscription{Plan: "points", TierName: "小浣熊积分"},
+		// 同 AutoClaw：余额型只给剩余一枚 chip，总额由 auth.Totals 反推。
 		Summary: []pluginapi.QuotaMetric{
 			{Key: "credit_remain", Label: "可用积分", Value: float64(available), Format: "number"},
 		},
@@ -291,6 +292,43 @@ func (v *adapter) CheckinUnsupportedReason(_ *core.Credential) string {
 	return "小浣熊没有每日签到；桌面端登录奖励为一次性领取"
 }
 
+// TaskSpecs 实现 core.TaskCatalogProvider：注册「每日积分」任务族。
+//
+// 每日积分由服务器在读取网页端 setting_info 时发放（source=daily），
+// 客户端没有其它可调用的签到端点，所以这是小浣熊唯一的每日任务。
+func (v *adapter) TaskSpecs() []core.TaskSpec {
+	return []core.TaskSpec{
+		{
+			Kind:         TaskKindDailyGrant,
+			Label:        "小浣熊每日积分",
+			Description:  "调用网页端 setting_info 触发服务器发放当日每日积分",
+			DefaultHours: []int{8},
+		},
+	}
+}
+
+// RunScheduled 实现 core.ScheduledRunner：执行「每日积分」任务族。
+func (v *adapter) RunScheduled(ctx context.Context, cred *core.Credential, kind string) (string, error) {
+	if kind != TaskKindDailyGrant {
+		return "", nil
+	}
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return "", errNative
+	}
+	granted, credit, errGrant := DailyGrantViaSetting(ctx, v.resolveOrigin(), native)
+	if errGrant != nil {
+		return "", errGrant
+	}
+	if !granted {
+		return "今日每日积分已发放（无需重复操作）", nil
+	}
+	if credit > 0 {
+		return fmt.Sprintf("每日积分发放 +%d", credit), nil
+	}
+	return "每日积分已发放", nil
+}
+
 // ---- 登录与续期 ----
 
 // LoginStart 发起一次网页授权登录：生成一次性 state 并登记会话，
@@ -300,6 +338,9 @@ func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.
 	state := core.RandomHex(32)
 	sessionID := VendorID + "_" + state
 	StoreLoginSession(v.Env.Logins, sessionID, &PendingLogin{State: state})
+	// 起 loopback 回调监听：授权页确认后浏览器直接打 127.0.0.1:<port>/auth/callback，
+	// 登录当场完成，不必再粘链接。端口被占或已有监听时静默退回粘贴流程。
+	v.startLoginCatcher(state)
 	return &pluginapi.AuthLoginStartResponse{
 		Provider:  core.ProviderKey,
 		URL:       AuthorizeURLWith(v.resolveOrigin(), loginAppName, state),
@@ -330,7 +371,35 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 
 // LocalCallbackHint 返回控制台要展示的回调形态（授权码换票兜底用）。
 func (v *adapter) LocalCallbackHint() string {
-	return "office-raccoon://auth/callback?code=…&state=…"
+	return CallbackURL() + "?code=…&state=…"
+}
+
+// startLoginCatcher 为本次登录挂上 loopback 回调监听。
+//
+// 授权页确认后会打 http://127.0.0.1:37913/auth/callback?code=…&state=…，
+// 命中即换票落盘。插件与浏览器不在同一台机器时回调打不到这里，用户从
+// 浏览器地址栏复制整条链接走 SubmitCallback，两条路共用 completeLogin。
+func (v *adapter) startLoginCatcher(state string) {
+	sessionID := VendorID + "_" + state
+	StartCallbackCatcher(state, func(code, callbackState string) (string, error) {
+		session, pollState := v.Env.Logins.Poll(sessionID)
+		if pollState == core.PollMissing {
+			return "", fmt.Errorf("登录会话不存在或已过期，请重新发起登录")
+		}
+		pending, okPending := session.Data.(*PendingLogin)
+		if !okPending {
+			return "", fmt.Errorf("登录会话数据已损坏，请重新发起登录")
+		}
+		if !CheckCallbackState(pending, callbackState) {
+			return "", fmt.Errorf("登录回调 state 校验失败，请重新发起登录")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, errComplete := v.completeLogin(ctx, sessionID, code); errComplete != nil {
+			return "", errComplete
+		}
+		return "小浣熊登录成功", nil
+	})
 }
 
 // SubmitCallback 解析用户粘贴的回调链接（或裸授权码）并换票完成登录。
@@ -349,7 +418,7 @@ func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*co
 	code, callbackState, okCode := ParseCallbackCode(rawURL)
 	if !okCode {
 		return nil, core.NewPluginError("callback_parse_failed",
-			"回调链接解析失败，请确认粘贴的是完整回调链接（office-raccoon://auth/callback?code=…）",
+			"回调链接解析失败，请确认粘贴的是完整回调链接（http://127.0.0.1:37913/auth/callback?code=…&state=…）",
 			http.StatusBadRequest)
 	}
 	if !CheckCallbackState(pending, callbackState) {
@@ -357,6 +426,11 @@ func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*co
 			"登录回调 state 校验失败，请重新发起登录",
 			http.StatusBadRequest)
 	}
+	return v.completeLogin(ctx, strings.TrimSpace(state), code)
+}
+
+// completeLogin 用授权码换票并产出凭证（SubmitCallback 与 loopback 回调共用）。
+func (v *adapter) completeLogin(ctx context.Context, sessionID, code string) (*core.CallbackSubmitResult, error) {
 	access, refresh, expiresAt, uid, errExchange := ExchangeAuthorizationCode(ctx, v.resolveAuthBase(), code)
 	if errExchange != nil {
 		return nil, core.ToPluginError(errExchange)
@@ -379,7 +453,7 @@ func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*co
 	if errStorage != nil {
 		return nil, core.NewPluginError("login_failed", "构建凭证失败："+errStorage.Error(), http.StatusInternalServerError)
 	}
-	v.Env.Logins.Delete(strings.TrimSpace(state))
+	v.Env.Logins.Delete(sessionID)
 	return &core.CallbackSubmitResult{
 		Status:  pluginapi.AuthLoginStatusSuccess,
 		Message: "小浣熊登录成功",
@@ -413,6 +487,41 @@ func (v *adapter) probeToken(ctx context.Context) (string, string) {
 	return native.AccessTokenValue(), authIndex
 }
 
+// AutoTaskCodeLoginGrant 是一键任务里「登录奖励」那一行的任务码。
+const AutoTaskCodeLoginGrant = "(登录奖励)"
+
+// RunAllTasks 执行一键任务。
+//
+// 小浣熊没有每日签到，客户端唯一能领的是官方桌面端登录弹窗的一次性积分，
+// 而且每号只能领一次。这里把它放进一键任务（幂等），已领过的按「已完成」
+// 上报，不产生失败历史。
+func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core.AutoTaskResult {
+	res, errCheckin := v.Checkin(ctx, cred)
+	if errCheckin != nil {
+		return []core.AutoTaskResult{{Code: AutoTaskCodeLoginGrant, Status: "error", Message: core.ToPluginError(errCheckin).Error()}}
+	}
+	if res == nil {
+		return nil
+	}
+	status := "done"
+	if res.Already {
+		status = "skipped"
+	}
+	return []core.AutoTaskResult{{Code: AutoTaskCodeLoginGrant, Status: status, Message: res.Message, Credit: res.Credit}}
+}
+
+// RunTask 执行单条任务。小浣熊只有一条一次性登录奖励。
+func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code string) (core.TaskRunResult, error) {
+	if strings.TrimSpace(code) != AutoTaskCodeLoginGrant {
+		return core.TaskRunResult{Status: "skipped", Message: "该供应商没有这条任务"}, nil
+	}
+	rows := v.RunAllTasks(ctx, cred)
+	if len(rows) == 0 {
+		return core.TaskRunResult{Status: "skipped", Message: "没有可执行的动作"}, nil
+	}
+	return core.TaskRunResult{Status: rows[0].Status, Message: rows[0].Message, Credit: rows[0].Credit}, nil
+}
+
 // 编译期断言：适配器实际具备的供应商能力。
 var (
 	_ core.Vendor               = (*adapter)(nil)
@@ -427,4 +536,5 @@ var (
 	_ core.QuotaProvider        = (*adapter)(nil)
 	_ core.Refresher            = (*adapter)(nil)
 	_ core.StorageMerger        = (*adapter)(nil)
+	_ core.TaskRunner           = (*adapter)(nil)
 )

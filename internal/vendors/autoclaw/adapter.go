@@ -8,7 +8,7 @@ package autoclaw
 // 能力面（对齐 Agent2API 实测协议）：
 //   - 凭证解析与偏严归属（accessToken/refreshToken 结构）；
 //   - chat 走 region proxy 通道（X-Request-Model 声明模型）；
-//   - 模型清单：各区域实时拉 autoclaw-model-config；
+//   - 模型清单：global 实时拉 autoclaw-model-config，cn 用静态表；
 //   - token 自动续期（POST /userapi/v1/refresh）；
 //   - 积分额度查询（GET /agent-assetmgr/api/v2/wallets）；
 //   - 每日签到（POST .../autoclaw-task-complete，幂等）。
@@ -53,6 +53,7 @@ type adapter struct {
 	catalogs  map[modelCatalogKey][]Model
 }
 
+// modelCatalogKey 是模型目录缓存的隔离键：上游基址 + 凭证 token 摘要。
 type modelCatalogKey struct {
 	baseURL   string
 	tokenHash [sha256.Size]byte
@@ -177,8 +178,8 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 
 // ModelsForAuth 返回该凭证可用的模型。
 //
-// 用该凭证自己的 token 探测；临时失败时保留该凭证最近成功的目录。
-// 目录只说明供应商有哪些模型，实际可用性由真实请求判断。
+// 用**该凭证自己的 token** 去探测：token 失效时该账号自然拿不到模型，
+// 宿主据此把它从选号里淘汰。
 func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]pluginapi.ModelInfo, error) {
 	native, errNative := v.Native(cred)
 	if errNative != nil {
@@ -206,16 +207,15 @@ func (v *adapter) fetchModels(ctx context.Context, token string) ([]Model, error
 		return models, nil
 	}
 	// 凭证失效是明确结论，不用旧目录把它重新注册为可用凭证。
-	// 控制台的共享目录仍由 Catalog 保留最后成功结果。
 	var failure *core.Failure
 	if errors.As(errModels, &failure) && (failure.Kind == core.FailureKindCredential || failure.Kind == core.FailureKindSessionDead) {
-		logger.Info("autoclaw: %s model probe failed: %v", v.ID(), errModels)
+		logger.Info("autoclaw：%s 模型探测失败：%v", v.ID(), errModels)
 		return nil, errModels
 	}
 	v.catalogMu.RLock()
 	cached := append([]Model(nil), v.catalogs[key]...)
 	v.catalogMu.RUnlock()
-	logger.Info("autoclaw: %s model probe failed: %v; keeping %d cached model(s)", v.ID(), errModels, len(cached))
+	logger.Info("autoclaw：%s 模型探测失败：%v；沿用 %d 个缓存模型", v.ID(), errModels, len(cached))
 	if len(cached) > 0 {
 		return cached, nil
 	}
@@ -314,6 +314,9 @@ func (v *adapter) Quota(ctx context.Context, cred *core.Credential) (*pluginapi.
 			Plan:     string(v.region),
 			TierName: VendorNameFor(v.region),
 		},
+		// 余额型额度：上游只回一个可用余额，没有「总额度」概念，所以这里
+		// 只放一枚 chip。页头的「剩余 / 总额」由 auth.Totals 反推
+		// （total = remaining + used），不要在这里编一个假的总额。
 		Summary: []pluginapi.QuotaMetric{
 			{Key: "credit_remain", Label: "剩余积分", Value: balance.TotalBalance, Format: "number"},
 		},
@@ -374,6 +377,28 @@ func (v *adapter) probeToken(ctx context.Context) (string, string) {
 	return native.AccessTokenValue(), authIndex
 }
 
+// RunAllTasks 执行一键任务。autoclaw 的活动福利只有签到这一条链路
+// （每日签到 + 登录活跃上报都在 Checkin 里），因此一键任务只产出签到那一行。
+func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core.AutoTaskResult {
+	results := make([]core.AutoTaskResult, 0, 1)
+	if row := core.CheckinAutoTask(ctx, v, cred); row != nil {
+		results = append(results, *row)
+	}
+	return results
+}
+
+// RunTask 执行单条任务。
+func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code string) (core.TaskRunResult, error) {
+	if strings.TrimSpace(code) != core.AutoTaskCodeCheckin {
+		return core.TaskRunResult{Status: "skipped", Message: "该供应商没有这条任务"}, nil
+	}
+	row := core.CheckinAutoTask(ctx, v, cred)
+	if row == nil {
+		return core.TaskRunResult{Status: "skipped", Message: "该账号不支持签到"}, nil
+	}
+	return core.TaskRunResult{Status: row.Status, Message: row.Message, Credit: row.Credit, Energy: row.Energy}, nil
+}
+
 // 编译期断言：适配器实际具备的供应商能力。
 var (
 	_ core.Vendor               = (*adapter)(nil)
@@ -385,6 +410,7 @@ var (
 	_ core.Refresher            = (*adapter)(nil)
 	_ core.StorageMerger        = (*adapter)(nil)
 	_ core.CreditsProvider      = (*adapter)(nil)
+	_ core.TaskRunner           = (*adapter)(nil)
 )
 
 // 编译期断言（登录能力随实例类型分派）。

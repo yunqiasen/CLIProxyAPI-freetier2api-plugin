@@ -525,13 +525,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
         <label title="开关只影响签到后自动执行的后续任务：开学季、连登奖励。其它成长任务不随签到自动跑，需在任务页手动执行。"><input type="checkbox" id="setAutoTasks"> 签到后自动跑后续任务（开学季 / 连登奖励）</label>
       </div>
       <div class="row" style="margin-top:8px">
-        <label>提示词防御模式
-          <select id="setPromptMode" style="margin-left:8px;padding:3px 6px">
-            <option value="passthrough">透传（保持客户端原始提示词）</option>
-            <option value="custom">替换（剥离特征提示词，注入纯净提示词）</option>
-            <option value="append">追加（文末追加安全指引）</option>
-          </select>
-        </label>
+        <label title="调用小浣熊网页端 setting_info 触发服务器发放当日每日积分（幂等，已发不重复）。"><input type="checkbox" id="setRaccoonDailyGrant"> 小浣熊每日积分</label>
       </div>
       <div class="row" style="margin-top:8px">
         <label>模型名渠道标识
@@ -833,6 +827,18 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   function shortReason(text) {
     var flat = String(text || "").replace(/\s+/g, " ").trim();
     return flat.length > 42 ? flat.slice(0, 42) + "…" : flat;
+  }
+
+  // pendingQuota 取「已领取、尚未生效」的额度（后端 metric key = pending）。
+  //
+  // 上游在授予生效前不建额度桶，所以这部分不会出现在 remain / total 里；
+  // 不单独显示，用户领到的几亿在页面上就没有任何痕迹。
+  function pendingQuota(quota) {
+    var metrics = (quota && quota.metrics) || [];
+    for (var i = 0; i < metrics.length; i++) {
+      if (metrics[i] && metrics[i].key === "pending") return metrics[i].value;
+    }
+    return 0;
   }
 
   // vendorChipClass 把供应商标识哈希到 v0..v5，交给 CSS 上彩色芯片底色。
@@ -1292,9 +1298,24 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
         if (!supportsCheckin) {
           row.appendChild(el("td", "无签到活动", "muted"));
         } else {
-          var checkinCell = el("td", checkin.last_date
-            ? (checkin.last_date + (checkin.streak ? " · 连续 " + checkin.streak + " 天" : ""))
-            : "未签到");
+          // 今日待复核由后端判定并下发布尔值，前端不自己拼。
+          // checkin_today 是后端按「last_date 是否等于今天」算出来的布尔，
+          // 用来把「今天签过了」和「上次签到是前几天」在颜色上分开。
+          var pendingToday = !!account.checkin_pending;
+          var confirmedToday = !!account.checkin_today;
+          var checkinCell = el("td", pendingToday
+            ? "待复核"
+            : (checkin.last_date
+              ? (checkin.last_date + (checkin.streak ? " · 连续 " + checkin.streak + " 天" : ""))
+              : "未签到"),
+            (!pendingToday && checkin.last_date && !confirmedToday) ? "muted" : null);
+          // 待复核：上游在北京时间 12 点前会对还没领到的账号回「已签到」，
+          // 此时不能显示成「已签到」，否则用户以为今天领过了。
+          if (pendingToday) {
+            checkinCell.className = "warn";
+            checkinCell.title = "上游称今日已签到，但北京时间 12 点前上游会误报，后续排程会再确认" +
+              (checkin.last_date ? "；上次确认签到：" + checkin.last_date : "");
+          }
           var history = account.checkin_history || [];
           if (history.length) {
             var historyBtn = el("button", "历史 " + history.length, "act");
@@ -1345,15 +1366,38 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
         // total=0 不等于「额度用尽」：有的上游只报可用余额（AutoClaw 的积分
         // 钱包只有 balance，没有总额/已用）。把 0 当总额会拼出「10000 / 0」
         // 再配一条红色 0% 空槽，既错又误导；此时按「余额 / —」展示，比例留空。
-        var hasTotal = quota.total > 0;
+        // has_total 由后端按「上游是否真的报了总额」给出，前端不靠 total>0 反推：
+        // 有的上游只报可用余额（AutoClaw 的积分钱包只有 balance），把 0 当总额
+        // 会拼出「10000 / 0」再配一条红色 0% 空槽，既错又误导。
+        var hasTotal = !!quota.has_total;
         var remainCell = el("td", quota.remain + " / " + (hasTotal ? quota.total : "—"));
         if (!hasTotal) {
           remainCell.title = "上游只提供可用余额，没有总额 / 已用概念";
+        } else if (!(quota.total > 0)) {
+          remainCell.title = "上游报了总额但它是 0，算不出剩余比例";
+        }
+        // 本次刷新失败、显示的是上次成功读数：必须标出来，否则旧数字会被
+        // 当成实时值。
+        if (quota.stale) {
+          remainCell.appendChild(el("span", " 非实时", "muted"));
+          remainCell.title = "本次刷新失败，显示上次读数" +
+            (quota.fetched_at ? "（取于 " + quota.fetched_at.slice(0, 19).replace("T", " ") + "）" : "") +
+            "：" + (quota.stale_reason || "原因未知");
         }
         row.appendChild(remainCell);
-        var ratio = hasTotal ? (quota.remain / quota.total) : 0;
+        // 待生效的活动授予跟在「剩余 / 总额」后面：它已经领到但还没进桶。
+        var pending = pendingQuota(quota);
+        if (pending > 0) {
+          var pendingTag = el("span", " 待生效 " + pending, "muted");
+          pendingTag.title = "已领取的活动额度，生效后并入上面的剩余 / 总额";
+          remainCell.appendChild(pendingTag);
+        }
+        // 分母守卫：has_total 只说明上游报了总额键，不保证它大于 0。
+        // 0/0 既不能相除（NaN%），也不能按 0% 画一条红色空槽。
+        var ratioKnown = hasTotal && quota.total > 0;
+        var ratio = ratioKnown ? (quota.remain / quota.total) : 0;
         var barCell = el("td");
-        if (hasTotal) {
+        if (ratioKnown) {
           // 阈值着色：剩余 >=50% 绿 / 20~50% 琥珀 / <20% 红（该列显示的即剩余比例）。
           var bar = el("span", null, ratio >= 0.5 ? "bar" : (ratio >= 0.2 ? "bar warn" : "bar err"));
           var fill = el("i");
@@ -1361,7 +1405,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
           bar.appendChild(fill);
           barCell.appendChild(bar);
         }
-        barCell.appendChild(el("span", hasTotal ? Math.round(ratio * 100) + "%" : "—", "muted"));
+        barCell.appendChild(el("span", ratioKnown ? Math.round(ratio * 100) + "%" : "—", "muted"));
         row.appendChild(barCell);
       }
 
@@ -1381,8 +1425,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     host.appendChild(table);
 
     var summary = el("div", "共 " + accounts.length + (filter ? " 个账号（显示 " + visible.length + " 个）" : " 个账号")
-      + " · 插件版本 " + (status.version || "-")
-      + " · 提示词 " + ((status.settings || {}).prompt_mode || "-"), "hint");
+      + " · 插件版本 " + (status.version || "-"), "hint");
     host.appendChild(summary);
 
     syncAccountSelection();
@@ -1404,8 +1447,8 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       document.getElementById("setAutoCheckin").checked = !!settings.auto_checkin;
       document.getElementById("setCheckinAt").value = settings.auto_checkin_at || "10:00";
       document.getElementById("setAutoTasks").checked = !!settings.auto_tasks;
-      var promptSel = document.getElementById("setPromptMode");
-      if (promptSel) promptSel.value = settings.prompt_mode || "passthrough";
+      var raccoonGrant = document.getElementById("setRaccoonDailyGrant");
+      if (raccoonGrant) raccoonGrant.checked = settings.auto_raccoon_daily_grant !== false;
       var tagSel = document.getElementById("setModelNameTag");
       if (tagSel) tagSel.value = settings.model_name_tag || "off";
       renderTaskSchedules(settings);
@@ -3410,12 +3453,11 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     }).catch(function (err) { banner("err", err.message); });
   });
   document.getElementById("btnSaveSettings").addEventListener("click", function () {
-    var promptSel = document.getElementById("setPromptMode");
     var payload = {
       auto_checkin: document.getElementById("setAutoCheckin").checked,
       auto_checkin_at: document.getElementById("setCheckinAt").value,
       auto_tasks: document.getElementById("setAutoTasks").checked,
-      prompt_mode: promptSel ? promptSel.value : "passthrough",
+      auto_raccoon_daily_grant: (document.getElementById("setRaccoonDailyGrant") || {}).checked !== false,
       model_name_tag: (document.getElementById("setModelNameTag") || {}).value || "off",
       task_schedules: {}
     };

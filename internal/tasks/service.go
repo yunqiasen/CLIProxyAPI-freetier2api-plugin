@@ -20,7 +20,7 @@ type Service struct {
 	pokeCh          chan string
 
 	taskLockMu sync.Mutex
-	taskLocks  map[string]*sync.Mutex
+	taskLocks  map[string]chan struct{}
 	queue      *queueState
 	// autoAll 是「一键完成」的后台任务状态（见 autoall.go）。
 	autoAll *autoAllJob
@@ -69,7 +69,7 @@ func New(deps Deps) *Service {
 		deps:      deps,
 		catalog:   NewCatalog(deps.Registry()),
 		pokeCh:    make(chan string, 4),
-		taskLocks: map[string]*sync.Mutex{},
+		taskLocks: map[string]chan struct{}{},
 		queue:     &queueState{},
 		autoAll:   &autoAllJob{},
 	}
@@ -87,6 +87,8 @@ func (s *Service) Start(ctx context.Context) {
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	s.schedulerCancel = cancel
+	// 签到历史只留当天：升级后第一次启动就把跨天残留清掉，不用等下一次签到。
+	s.pruneCheckinHistory()
 	s.jobMu.Lock()
 	jobCtx, jobCancel := context.WithCancel(context.Background())
 	s.jobCtx, s.jobCancel = jobCtx, jobCancel

@@ -305,7 +305,6 @@ func (v *adapter) settingsSnapshot() map[string]string {
 // ConfigFields 声明 Qoder 专属 YAML 配置。
 func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{
-		{Name: "qoder_desktop_version", Type: pluginapi.ConfigFieldTypeString, Description: "cosy-version 桌面端版本覆盖。"},
 		{Name: "qoder_machine_token", Type: pluginapi.ConfigFieldTypeString, Description: "官方组件签发的 machineToken，用于解锁国际版每日领取活动。"},
 		{Name: "qoder_machine_type", Type: pluginapi.ConfigFieldTypeString, Description: "与 qoder_machine_token 配对的 machineType，必须成对填写。"},
 		{Name: "qoder_machine_code", Type: pluginapi.ConfigFieldTypeString, Description: "可选的 machineCode（不填不影响活动可见性）。"},
@@ -345,10 +344,13 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 		return &pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending}, nil
 	}
 	plan := FetchPlanName(ctx, result.Token, result.Region)
-	storage, cred := BuildLoginStorage(result.Region, result.Token, result.RefreshToken, result.Profile, plan)
+	// 设备身份：登录这台机器上若装过官方客户端，直接把 runtime-info 签发的
+	// machineToken/machineType 写进凭证——国际版活动按它精确校验，缺了就只能
+	// 看到「无可用签到活动」。
+	storage, cred := BuildLoginStorage(result.Region, result.Token, result.RefreshToken, result.Profile, plan, v.localMachineIdentity())
 	authID := LoginAuthID(result.Profile, state)
 	fileName := core.FileNameFor(v.ID(), strings.TrimPrefix(authID, "qoder-"))
-	logger.Info("completed qoder login (vendor=%s email=%s)", v.ID(), cred.Email)
+	logger.Info("qoder 登录完成（供应商=%s 邮箱=%s）", v.ID(), cred.Email)
 	return &pluginapi.AuthLoginPollResponse{
 		Status:  pluginapi.AuthLoginStatusSuccess,
 		Message: "登录成功",
@@ -537,6 +539,29 @@ func (r *payloadRecorder) Payload() []byte { return r.body }
 
 func (v *adapter) SupportsCheckin() bool { return true }
 
+// RunAllTasks 执行一键任务。Qoder 的活动福利只有一条链路：每日领取
+// 会把当天开放的 campaign（活动）一并领取，协议层的 Checkin 已经覆盖，
+// 所以这里只产出签到那一行，不额外造空行。
+func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core.AutoTaskResult {
+	results := make([]core.AutoTaskResult, 0, 1)
+	if row := core.CheckinAutoTask(ctx, v, cred); row != nil {
+		results = append(results, *row)
+	}
+	return results
+}
+
+// RunTask 执行单条任务。Qoder 可自动执行的动作只有签到/活动领取。
+func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code string) (core.TaskRunResult, error) {
+	if strings.TrimSpace(code) != core.AutoTaskCodeCheckin {
+		return core.TaskRunResult{Status: "skipped", Message: "该供应商没有这条任务"}, nil
+	}
+	row := core.CheckinAutoTask(ctx, v, cred)
+	if row == nil {
+		return core.TaskRunResult{Status: "skipped", Message: "该账号不支持签到"}, nil
+	}
+	return core.TaskRunResult{Status: row.Status, Message: row.Message, Credit: row.Credit, Energy: row.Energy}, nil
+}
+
 // 编译期断言：适配器实际具备的供应商能力。
 var (
 	_ core.Vendor               = (*adapter)(nil)
@@ -549,4 +574,5 @@ var (
 	_ core.ModelsProvider       = (*adapter)(nil)
 	_ core.QuotaProvider        = (*adapter)(nil)
 	_ core.StorageMerger        = (*adapter)(nil)
+	_ core.TaskRunner           = (*adapter)(nil)
 )

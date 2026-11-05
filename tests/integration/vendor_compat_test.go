@@ -88,7 +88,7 @@ func TestVendorCapabilities(t *testing.T) {
 		"opencodezen":       {credits: true, refresh: true, models: true, merge: true, configure: true, authMode: "apikey"},
 		"qodercn":           {credits: true, login: true, refresh: true, quota: true, checkin: true, models: true, merge: true, configure: true},
 		"qoderglobal":       {credits: true, login: true, refresh: true, quota: true, checkin: true, models: true, merge: true, configure: true},
-		"raccoon":           {credits: true, login: true, refresh: true, quota: true, checkin: true, models: true, merge: true, configure: true},
+		"raccoon":           {credits: true, login: true, refresh: true, quota: true, checkin: true, tasks: true, models: true, merge: true, configure: true},
 		"traecn":            {credits: true, login: true, refresh: true, quota: true, checkin: true, tasks: true, merge: true, configure: true},
 		// tasks 是「接口能力」而不是「本区域有族」：国际版实现了 TaskCatalogProvider
 		// 但 TaskSpecs() 返回空（活动福利只在国内版），与 checkin 同一种约定。
