@@ -74,12 +74,17 @@ func (a *App) HandleMethod(method string, request []byte) ([]byte, error) {
 		return a.handleModelForAuth(request)
 
 	case pluginabi.MethodAuthIdentifier:
-		// 面板「OAuth 登录」列表只渲染 oauth_provider 非空的插件（前端过滤
-		// `!r` 直接跳过），所以这里不发布任何 OAuth 标识：FreeTier 2API 不出现
-		// 在该列表里，登录/添加账号只走插件自己的控制台。
-		// 但必须同时用 credential_providers 认领 auth 文件里的 type=freetier，
-		// 否则宿主的 authProviderEntry 会认不出这些凭证，模型与执行器全部掉线。
-		return core.OKEnvelope(identifierResponse{CredentialProviders: []string{providerKey}})
+		// 宿主认领凭证有两条路：
+		//   1. 旧宿主只看 identifier（authProviderEntry 按它匹配 auth 文件的 type）；
+		//   2. 新宿主读 credential_providers，允许 identifier 为空从而隐藏 OAuth 列表项。
+		// 只发 credential_providers 会让旧宿主（本项目现用的 CPA 就是）认不出凭证：
+		// 热重载后全部 auth 被 unregister、模型从 /v1/models 消失、测速 503。
+		// 因此两个字段同时发：旧宿主按 identifier 认领，新宿主优先用 credential_providers。
+		return core.OKEnvelope(identifierResponse{
+			Identifier:          providerKey,
+			Identifiers:         []string{providerKey},
+			CredentialProviders: []string{providerKey},
+		})
 	case pluginabi.MethodAuthParse:
 		return a.handleAuthParse(request)
 	case pluginabi.MethodAuthLoginStart:

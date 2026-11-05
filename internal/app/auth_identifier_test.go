@@ -11,9 +11,9 @@ import (
 	"freetier2api-plugin/internal/core"
 )
 
-// 面板「OAuth 登录」列表按 oauth_provider 过滤，空则不渲染；
-// 同时 credential_providers 必须认领 type=freetier，否则凭证全掉线。
-func TestAuthIdentifierHidesOAuthButKeepsCredentialProvider(t *testing.T) {
+// 宿主认领凭证的两条路必须同时满足：旧宿主只读 identifier，
+// 新宿主读 credential_providers。任何一条缺失都会让凭证在热重载后掉线。
+func TestAuthIdentifierKeepsHostClaimAndCredentialProvider(t *testing.T) {
 	a := &App{}
 	raw, err := a.HandleMethod(pluginabi.MethodAuthIdentifier, []byte(`{}`))
 	if err != nil {
@@ -33,8 +33,11 @@ func TestAuthIdentifierHidesOAuthButKeepsCredentialProvider(t *testing.T) {
 	if !env.OK {
 		t.Fatalf("not ok: %s", raw)
 	}
-	if env.Data.Identifier != "" || len(env.Data.Identifiers) != 0 {
-		t.Fatalf("oauth identifiers must be empty: %s", raw)
+	if env.Data.Identifier != "freetier" {
+		t.Fatalf("legacy identifier must claim freetier: %s", raw)
+	}
+	if len(env.Data.Identifiers) != 1 || env.Data.Identifiers[0] != "freetier" {
+		t.Fatalf("identifiers must claim freetier: %s", raw)
 	}
 	if len(env.Data.CredentialProviders) != 1 || env.Data.CredentialProviders[0] != "freetier" {
 		t.Fatalf("credential providers must claim freetier: %s", raw)
