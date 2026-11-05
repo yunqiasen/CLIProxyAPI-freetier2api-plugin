@@ -200,7 +200,10 @@ class DockerBuilder:
                 "-v", f"{snapshot}:/w:ro", "-v", f"{dist}:/out", "-v", f"{cache}:/cache", "-w", "/w"]
         for value in ("CGO_ENABLED=1", "GOFLAGS=-buildvcs=false", "GOTOOLCHAIN=local", "GOPROXY=off",
                       "GOSUMDB=off", "HOME=/cache/home", "GOCACHE=/cache/go-build", "GOMODCACHE=/cache/go-mod",
-                      "GOPATH=/cache/go", "TMPDIR=/cache/tmp"):
+                      "GOPATH=/cache/go", "TMPDIR=/cache/tmp",
+                      # 离线构建没有网络：Qoder 内置组件首次运行要联网注册设备身份，
+                      # 相关用例据此跳过（联网用例在开发机/CI 上照常跑）。
+                      "QODER_NO_EMBEDDED_RUNTIME_INFO=1"):
             argv.extend(["-e", value])
         argv.extend([self.image, "-ec", _BUILD_SCRIPT, "local-delivery", version, filename])
         try:

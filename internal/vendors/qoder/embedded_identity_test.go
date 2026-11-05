@@ -3,6 +3,7 @@ package qoder
 import (
 	"os"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -10,6 +11,9 @@ import (
 func TestExtractEmbeddedRuntimeInfo(t *testing.T) {
 	if embeddedAssetPath() == "" {
 		t.Skip("该平台未内置 runtime-info")
+	}
+	if embeddedRuntimeDisabled() {
+		t.Skip("QODER_NO_EMBEDDED_RUNTIME_INFO 已设置（离线构建）")
 	}
 	path, okExtract := extractEmbeddedRuntimeInfo()
 	if !okExtract {
@@ -44,6 +48,10 @@ func TestEmbeddedMachineIdentity(t *testing.T) {
 	if embeddedAssetPath() == "" {
 		t.Skip("该平台未内置 runtime-info")
 	}
+	// 组件首次运行需要联网注册设备身份；离线构建（--network none）里只能跳过。
+	if embeddedRuntimeDisabled() {
+		t.Skip("QODER_NO_EMBEDDED_RUNTIME_INFO 已设置（离线构建）")
+	}
 	identity := embeddedMachineIdentity(RegionGlobal)
 	if !identity.Native() {
 		t.Fatalf("未生成机器身份")
@@ -51,4 +59,13 @@ func TestEmbeddedMachineIdentity(t *testing.T) {
 	if len(identity.Token) < 32 || identity.Type == "" {
 		t.Fatalf("身份字段不完整: token_len=%d type=%q", len(identity.Token), identity.Type)
 	}
+}
+
+// embeddedRuntimeDisabled 报告是否显式关闭了内置组件（离线构建用）。
+func embeddedRuntimeDisabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("QODER_NO_EMBEDDED_RUNTIME_INFO"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
