@@ -56,6 +56,12 @@ func ToPluginError(err error) error {
 	if err == nil {
 		return nil
 	}
+	// Adapter and executor can both translate the same error. Preserve the
+	// existing host contract, including retry delay and probe request-stop.
+	var existing *PluginError
+	if errors.As(err, &existing) {
+		return existing
+	}
 	var upstreamErr UpstreamError
 	if errors.As(err, &upstreamErr) {
 		status := upstreamErr.HTTPStatus()
