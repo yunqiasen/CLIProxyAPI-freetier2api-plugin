@@ -88,12 +88,11 @@ func ToPluginError(err error) error {
 	if failure := classifyTransportError(err); failure != nil {
 		status := failure.HTTPStatus()
 		code := upstreamCode(failure.Kind.String())
-		if failure.Retryable() {
-			return RetryablePluginError(code, failure.Msg, status)
-		}
-		return NewPluginError(code, failure.Msg, status)
+		return &PluginError{Code: code, Message: failure.Msg, HTTPStatus: status,
+			Retryable: failure.Retryable(), cause: err}
 	}
-	return RetryablePluginError("upstream_request_failed", err.Error(), http.StatusBadGateway)
+	return &PluginError{Code: "upstream_request_failed", Message: err.Error(),
+		HTTPStatus: http.StatusBadGateway, Retryable: true, cause: err}
 }
 
 // transportStatusHints 是宿主桥错误文本里出现的状态短语到状态码的映射。
@@ -549,6 +548,9 @@ func ToProbeError(err error) error {
 	var existing *PluginError
 	if errors.As(err, &existing) {
 		status = existing.HTTPStatus
+		if detail == nil && existing.cause != nil {
+			message = existing.cause.Error()
+		}
 	}
 	var coded interface{ StatusCode() int }
 	if errors.As(err, &coded) && coded.StatusCode() > 0 {

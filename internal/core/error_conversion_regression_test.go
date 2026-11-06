@@ -21,3 +21,24 @@ func TestToPluginErrorIsIdempotent(t *testing.T) {
 		t.Fatalf("double conversion: first=%+v second=%+v", first, second)
 	}
 }
+
+func TestToProbeErrorPreservesBridgeEvidenceThroughConversion(t *testing.T) {
+	for _, raw := range []string{
+		`host.http.do: host_call_failed: HTTP 429 Too Many Requests; upstream request_id=REQ_FIXTURE; {"code":"daily_limit","message":"quota detail"}`,
+		`Post "https://fixture.invalid/chat": host.http.do_stream: host_call_failed: EOF`,
+	} {
+		original := errors.New(raw)
+		converted := ToPluginError(ToPluginError(original))
+		probe := ToProbeError(fmt.Errorf("executor: %w", converted)).(*PluginError)
+		if probe.Message != raw {
+			t.Errorf("lost upstream evidence: got %q want %q", probe.Message, raw)
+		}
+		wantStatus := 429
+		if raw[len(raw)-3:] == "EOF" {
+			wantStatus = 502
+		}
+		if probe.HTTPStatus != wantStatus || !probe.RequestStop || probe.Retryable {
+			t.Errorf("wrong probe contract: %+v", probe)
+		}
+	}
+}
