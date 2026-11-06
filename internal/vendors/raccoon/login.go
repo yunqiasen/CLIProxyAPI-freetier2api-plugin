@@ -54,7 +54,9 @@ const (
 //
 // TTL 与轮询节流由 internal/auth 的会话表统一管理，这里只保留协议状态。
 type PendingLogin struct {
-	State string
+	State  string
+	mu     sync.Mutex
+	result *core.CallbackSubmitResult
 }
 
 // StoreLoginSession 登记一次进行中的登录会话。

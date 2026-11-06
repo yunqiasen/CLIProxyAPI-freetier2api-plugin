@@ -356,12 +356,20 @@ func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.
 // 经 SubmitCallback 到达。这里只回报进度；state 失配（用户粘贴）由
 // SubmitCallback 拒绝。
 func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollResponse, error) {
-	_, exists, _ := CheckLoginSession(v.Env.Logins, state)
+	pending, exists, _ := CheckLoginSession(v.Env.Logins, state)
 	if !exists {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: "登录会话不存在或已过期，请重新发起登录",
 		}, nil
+	}
+	pending.mu.Lock()
+	defer pending.mu.Unlock()
+	if pending.result != nil {
+		// The host persists Auth after a successful poll. Keep it until session
+		// expiry so a failed save or lost poll response can be retried.
+		return &pluginapi.AuthLoginPollResponse{Status: pending.result.Status,
+			Message: pending.result.Message, Auth: pending.result.Auth}, nil
 	}
 	return &pluginapi.AuthLoginPollResponse{
 		Status:  pluginapi.AuthLoginStatusPending,
@@ -398,7 +406,7 @@ func (v *adapter) startLoginCatcher(state string) {
 		if _, errComplete := v.completeLogin(ctx, sessionID, code); errComplete != nil {
 			return "", errComplete
 		}
-		return "小浣熊登录成功", nil
+		return "授权已接收，请返回控制台等待账号保存。", nil
 	})
 }
 
@@ -431,6 +439,15 @@ func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*co
 
 // completeLogin 用授权码换票并产出凭证（SubmitCallback 与 loopback 回调共用）。
 func (v *adapter) completeLogin(ctx context.Context, sessionID, code string) (*core.CallbackSubmitResult, error) {
+	pending, exists, _ := CheckLoginSession(v.Env.Logins, sessionID)
+	if !exists {
+		return nil, core.NewPluginError("session_not_found", "登录会话不存在或已过期，请重新发起登录", http.StatusNotFound)
+	}
+	pending.mu.Lock()
+	defer pending.mu.Unlock()
+	if pending.result != nil {
+		return pending.result, nil
+	}
 	access, refresh, expiresAt, uid, errExchange := ExchangeAuthorizationCode(ctx, v.resolveAuthBase(), code)
 	if errExchange != nil {
 		return nil, core.ToPluginError(errExchange)
@@ -453,8 +470,7 @@ func (v *adapter) completeLogin(ctx context.Context, sessionID, code string) (*c
 	if errStorage != nil {
 		return nil, core.NewPluginError("login_failed", "构建凭证失败："+errStorage.Error(), http.StatusInternalServerError)
 	}
-	v.Env.Logins.Delete(sessionID)
-	return &core.CallbackSubmitResult{
+	pending.result = &core.CallbackSubmitResult{
 		Status:  pluginapi.AuthLoginStatusSuccess,
 		Message: "小浣熊登录成功",
 		Auth: pluginapi.AuthData{
@@ -463,7 +479,8 @@ func (v *adapter) completeLogin(ctx context.Context, sessionID, code string) (*c
 			Label:       core.FirstNonEmpty(credential.NicknameValue(), credential.UIDOrTokenID()),
 			StorageJSON: storageJSON,
 		},
-	}, nil
+	}
+	return pending.result, nil
 }
 
 // MergeCredentialJSON 实现存储合并（见 credential.go）。
