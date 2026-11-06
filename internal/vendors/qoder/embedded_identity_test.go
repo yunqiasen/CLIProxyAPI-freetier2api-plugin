@@ -2,6 +2,7 @@ package qoder
 
 import (
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -68,4 +69,49 @@ func embeddedRuntimeDisabled() bool {
 		return true
 	}
 	return false
+}
+
+func TestLocalMachineIdentityKeepsEmbeddedRegionsSeparate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture")
+	}
+	disableLocalMachineIdentity(t)
+	dir := t.TempDir()
+	executable := filepath.Join(dir, "runtime-info")
+	script := "#!/bin/sh\nprintf '{\"machineToken\":\"fixture-%s\",\"machineType\":\"fixture-type\"}' \"$1\"\n"
+	if err := os.WriteFile(executable, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	oldExecutable := embeddedRuntimeInfoExecutable
+	oldCache := embeddedIdentities
+	embeddedIdentities = nil
+	embeddedRuntimeInfoExecutable = func() (string, bool) { return executable, true }
+	t.Cleanup(func() {
+		embeddedRuntimeInfoExecutable = oldExecutable
+		embeddedIdentities = oldCache
+	})
+	for _, region := range []Region{RegionCN, RegionGlobal, RegionCN, RegionGlobal} {
+		got := LocalMachineIdentity(region)
+		want := "fixture-0"
+		if region == RegionGlobal {
+			want = "fixture-3"
+		}
+		if got.Token != want {
+			t.Fatalf("region %s reused wrong identity: %q want %q", region, got.Token, want)
+		}
+	}
+	// Cached identities stay usable without relaunching the component.
+	if err := os.Remove(executable); err != nil {
+		t.Fatal(err)
+	}
+	for _, region := range []Region{RegionCN, RegionGlobal} {
+		got := LocalMachineIdentity(region)
+		want := "fixture-0"
+		if region == RegionGlobal {
+			want = "fixture-3"
+		}
+		if got.Token != want {
+			t.Fatalf("region %s lost cached identity: %q", region, got.Token)
+		}
+	}
 }

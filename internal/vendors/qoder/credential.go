@@ -467,10 +467,16 @@ const (
 //go:embed assets/runtime-info-*
 var embeddedAssets embed.FS
 
+type embeddedIdentityEntry struct {
+	identity MachineIdentity
+	at       time.Time
+}
+
 var (
-	embeddedIdentityMu    sync.Mutex
-	embeddedIdentityAt    time.Time
-	embeddedIdentityValue MachineIdentity
+	// Component extraction is a process boundary; tests supply an offline executable.
+	embeddedRuntimeInfoExecutable = extractEmbeddedRuntimeInfo
+	embeddedIdentityMu            sync.Mutex
+	embeddedIdentities            map[Region]embeddedIdentityEntry
 )
 
 // embeddedMachineIdentity 用内置组件生成本机身份；失败返回零值。
@@ -478,10 +484,10 @@ func embeddedMachineIdentity(region Region) MachineIdentity {
 	embeddedIdentityMu.Lock()
 	defer embeddedIdentityMu.Unlock()
 
-	if embeddedIdentityValue.Native() && time.Since(embeddedIdentityAt) < embeddedIdentityTTL {
-		return embeddedIdentityValue
+	if cached := embeddedIdentities[region]; cached.identity.Native() && time.Since(cached.at) < embeddedIdentityTTL {
+		return cached.identity
 	}
-	executable, okExtract := extractEmbeddedRuntimeInfo()
+	executable, okExtract := embeddedRuntimeInfoExecutable()
 	if !okExtract {
 		return MachineIdentity{}
 	}
@@ -489,7 +495,10 @@ func embeddedMachineIdentity(region Region) MachineIdentity {
 	if !okRun {
 		return MachineIdentity{}
 	}
-	embeddedIdentityAt, embeddedIdentityValue = time.Now(), identity
+	if embeddedIdentities == nil {
+		embeddedIdentities = make(map[Region]embeddedIdentityEntry)
+	}
+	embeddedIdentities[region] = embeddedIdentityEntry{identity: identity, at: time.Now()}
 	return identity
 }
 
