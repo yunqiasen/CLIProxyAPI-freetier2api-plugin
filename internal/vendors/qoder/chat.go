@@ -47,7 +47,7 @@ import (
 // 裸 JSON 载荷，帧包装交给宿主。
 
 // RunChatCompletions 执行一次非流式 chat-completions，把响应体写进 w。
-func RunChatCompletions(b *Bridge, payload []byte, w io.Writer) error {
+func RunChatCompletions(ctx context.Context, b *Bridge, payload []byte, w io.Writer) error {
 	req, errDecode := decodeChatRequest(payload)
 	if errDecode != nil {
 		return errDecode
@@ -59,7 +59,7 @@ func RunChatCompletions(b *Bridge, payload []byte, w io.Writer) error {
 	var content strings.Builder
 	var toolCallBuf []interface{}
 	var inputTokens, outputTokens int
-	errCall := b.CallQoder(context.Background(), InferAgent(req.Model), messages, req.Model, req.Tools, func(d Delta) {
+	errCall := b.CallQoder(ctx, InferAgent(req.Model), messages, req.Model, req.Tools, func(d Delta) {
 		if d.InputTokens > 0 || d.OutputTokens > 0 {
 			inputTokens, outputTokens = d.InputTokens, d.OutputTokens
 		}
@@ -874,6 +874,9 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 	queueWaits := 0
 	maxQueueWaits := QueueMaxWaits()
 	for attempt := 0; attempt <= TransientMaxRetries+maxQueueWaits; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if attempt > 0 {
 			if !core.SleepContext(ctx, RetryBackoff(attempt)) {
 				return ctx.Err()

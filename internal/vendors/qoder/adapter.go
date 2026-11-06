@@ -209,6 +209,9 @@ func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]p
 
 // Execute 执行一次非流式对话。
 func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.ExecuteRequest) (*pluginapi.ExecutorResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
@@ -220,7 +223,7 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 	// 复用 bridge 的 chat-completions 组装逻辑，但把结果写进内存而不是
 	// http.ResponseWriter——插件侧不做 HTTP 响应，只产出载荷。
 	recorder := newPayloadRecorder()
-	if errRun := RunChatCompletions(b, req.Payload, recorder); errRun != nil {
+	if errRun := RunChatCompletions(ctx, b, req.Payload, recorder); errRun != nil {
 		return nil, errRun
 	}
 	return &pluginapi.ExecutorResponse{
