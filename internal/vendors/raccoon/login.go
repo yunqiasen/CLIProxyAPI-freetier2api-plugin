@@ -60,6 +60,16 @@ type PendingLogin struct {
 	result *core.CallbackSubmitResult
 }
 
+// copyResult is called with mu held; consumers receive their own auth bytes.
+func (p *PendingLogin) copyResult() *core.CallbackSubmitResult {
+	if p.result == nil {
+		return nil
+	}
+	result := *p.result
+	result.Auth.StorageJSON = append([]byte(nil), p.result.Auth.StorageJSON...)
+	return &result
+}
+
 // StoreLoginSession 登记一次进行中的登录会话。
 func StoreLoginSession(logins core.LoginSessions, sessionID string, session *PendingLogin) {
 	if session == nil {

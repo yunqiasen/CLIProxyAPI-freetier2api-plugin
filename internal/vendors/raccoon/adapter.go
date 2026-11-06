@@ -353,9 +353,8 @@ func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.
 
 // LoginPoll 轮询一次登录状态。
 //
-// 授权页模式没有可轮询的上游端点：凭证只在用户把回调链接粘回来时
-// 经 SubmitCallback 到达。这里只回报进度；state 失配（用户粘贴）由
-// SubmitCallback 拒绝。
+// 回调或粘贴换票后保留结果至会话过期；宿主轮询取到凭证后负责保存。
+// 保存失败可沿粘贴入口重试，不重复消费一次性授权码。
 func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollResponse, error) {
 	pending, exists, _ := CheckLoginSession(v.Env.Logins, state)
 	if !exists {
@@ -366,11 +365,11 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 	}
 	pending.mu.Lock()
 	defer pending.mu.Unlock()
-	if pending.result != nil {
+	if result := pending.copyResult(); result != nil {
 		// The host persists Auth after a successful poll. Keep it until session
 		// expiry so a failed save or lost poll response can be retried.
-		return &pluginapi.AuthLoginPollResponse{Status: pending.result.Status,
-			Message: pending.result.Message, Auth: pending.result.Auth}, nil
+		return &pluginapi.AuthLoginPollResponse{Status: result.Status,
+			Message: result.Message, Auth: result.Auth}, nil
 	}
 	return &pluginapi.AuthLoginPollResponse{
 		Status:  pluginapi.AuthLoginStatusPending,
@@ -386,7 +385,7 @@ func (v *adapter) LocalCallbackHint() string {
 // startLoginCatcher 为本次登录挂上 loopback 回调监听。
 //
 // 授权页确认后会打 http://127.0.0.1:37913/auth/callback?code=…&state=…，
-// 命中即换票落盘。插件与浏览器不在同一台机器时回调打不到这里，用户从
+// 命中即换票，随后由宿主轮询落盘。插件与浏览器不在同一台机器时回调打不到这里，用户从
 // 浏览器地址栏复制整条链接走 SubmitCallback，两条路共用 completeLogin。
 func (v *adapter) startLoginCatcher(state string) {
 	sessionID := VendorID + "_" + state
@@ -453,7 +452,7 @@ func (v *adapter) completeLogin(ctx context.Context, sessionID, code string) (*c
 	pending.mu.Lock()
 	defer pending.mu.Unlock()
 	if pending.result != nil {
-		return pending.result, nil
+		return pending.copyResult(), nil
 	}
 	access, refresh, expiresAt, uid, errExchange := ExchangeAuthorizationCode(ctx, v.resolveAuthBase(), code)
 	if errExchange != nil {
@@ -487,7 +486,7 @@ func (v *adapter) completeLogin(ctx context.Context, sessionID, code string) (*c
 			StorageJSON: storageJSON,
 		},
 	}
-	return pending.result, nil
+	return pending.copyResult(), nil
 }
 
 // MergeCredentialJSON 实现存储合并（见 credential.go）。

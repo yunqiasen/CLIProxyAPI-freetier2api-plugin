@@ -72,6 +72,20 @@ func TestRaccoonCallbackMakesAuthAvailableToHostPoll(t *testing.T) {
 			t.Fatalf("host cannot save callback auth: status=%s filename=%s", polled.Status, polled.Auth.FileName)
 		}
 	}
+	// A failed host save may fall back to the paste endpoint. Reuse the
+	// completed result without spending the single-use code again.
+	pasted, err := instance.SubmitLoginCallback(context.Background(), started.State, callback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pasted.Auth.StorageJSON[0] = '!'
+	again, err := instance.SubmitLoginCallback(context.Background(), started.State, callback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(again.Auth.StorageJSON) {
+		t.Fatal("caller mutated cached callback auth")
+	}
 	if exchanges.Load() != 1 {
 		t.Fatalf("single-use code exchanged %d times", exchanges.Load())
 	}
