@@ -5,6 +5,7 @@ package app
 
 import (
 	"context"
+	"io"
 	"sync"
 	"time"
 
@@ -79,6 +80,13 @@ func (a *App) StopBackgroundWork() {
 		cancel()
 	}
 	a.tasks.Stop()
+	for _, vendor := range a.registry.Vendors() {
+		if closer, ok := core.As[io.Closer](vendor); ok {
+			if err := closer.Close(); err != nil {
+				logger.Error("关闭供应商 %s：%v", vendor.ID(), err)
+			}
+		}
+	}
 	a.backgroundWG.Wait()
 	// 写盘是合并到短窗口里做的（state.saveDelay）：关停前必须 Flush——它既把
 	// 窗口内的改动写掉，也取消挂起的定时器（否则卸载后定时器仍会醒来碰状态）。

@@ -39,7 +39,8 @@ type adapter struct {
 	//
 	// 宿主契约（pluginapi.ModelInfo）没有倍率字段，控制台只能通过
 	// core.CreditsProvider 拿到，因此和模型清单在同一轮解析里一起产出。
-	credits core.CreditTable
+	credits      core.CreditTable
+	loginCatcher CallbackCatcher
 }
 
 // Instances 构造小浣熊实例（只有一个，没有区域之分）。
@@ -389,7 +390,7 @@ func (v *adapter) LocalCallbackHint() string {
 // 浏览器地址栏复制整条链接走 SubmitCallback，两条路共用 completeLogin。
 func (v *adapter) startLoginCatcher(state string) {
 	sessionID := VendorID + "_" + state
-	StartCallbackCatcher(state, func(code, callbackState string) (string, error) {
+	v.loginCatcher.Start(state, qrLoginTTL, func(requestCtx context.Context, code, callbackState string) (string, error) {
 		session, pollState := v.Env.Logins.Poll(sessionID)
 		if pollState == core.PollMissing {
 			return "", fmt.Errorf("登录会话不存在或已过期，请重新发起登录")
@@ -401,13 +402,19 @@ func (v *adapter) startLoginCatcher(state string) {
 		if !CheckCallbackState(pending, callbackState) {
 			return "", fmt.Errorf("登录回调 state 校验失败，请重新发起登录")
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(requestCtx, 30*time.Second)
 		defer cancel()
 		if _, errComplete := v.completeLogin(ctx, sessionID, code); errComplete != nil {
 			return "", errComplete
 		}
 		return "授权已接收，请返回控制台等待账号保存。", nil
 	})
+}
+
+// Close releases this instance's local listener before hot reload.
+func (v *adapter) Close() error {
+	v.loginCatcher.Stop()
+	return nil
 }
 
 // SubmitCallback 解析用户粘贴的回调链接（或裸授权码）并换票完成登录。

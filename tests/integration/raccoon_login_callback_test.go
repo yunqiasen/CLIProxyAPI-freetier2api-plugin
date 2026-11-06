@@ -1,8 +1,10 @@
 package tests
 
 import (
+	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -30,7 +32,7 @@ func TestRaccoonCallbackMakesAuthAvailableToHostPoll(t *testing.T) {
 		return testhost.UpstreamResponse{Status: 200, Body: `{"code":0,"data":{"id":"USER_FIXTURE","name":"登录夹具"}}`}
 	})
 	hostbridge.Configure(host.Call)
-	t.Cleanup(func() { raccoon.StopCallbackCatcher(); hostbridge.Configure(nil) })
+	t.Cleanup(func() { hostbridge.Configure(nil) })
 	instance, request := newLifecycleFixture(t, app.Options{Factories: []core.VendorFactory{{Instances: raccoon.Instances}}})
 	callLifecycle(t, instance, pluginabi.MethodPluginRegister, request)
 	raw, err := instance.HandleMethod(pluginabi.MethodAuthLoginStart, mustMarshal(map[string]any{"metadata": map[string]any{"vendor": "raccoon"}}))
@@ -72,5 +74,75 @@ func TestRaccoonCallbackMakesAuthAvailableToHostPoll(t *testing.T) {
 	}
 	if exchanges.Load() != 1 {
 		t.Fatalf("single-use code exchanged %d times", exchanges.Load())
+	}
+}
+
+func TestRaccoonCallbackListenerClosesOnPluginQuiesce(t *testing.T) {
+	hostbridge.Configure(testhost.New().Call)
+	t.Cleanup(func() { hostbridge.Configure(nil) })
+	instance, request := newLifecycleFixture(t, app.Options{Factories: []core.VendorFactory{{Instances: raccoon.Instances}}})
+	callLifecycle(t, instance, pluginabi.MethodPluginRegister, request)
+	start := func() {
+		_, err := instance.HandleMethod(pluginabi.MethodAuthLoginStart, mustMarshal(map[string]any{"metadata": map[string]any{"vendor": "raccoon"}}))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	start()
+	callLifecycle(t, instance, pluginabi.MethodPluginQuiesce, nil)
+	listener, err := net.Listen("tcp", "127.0.0.1:37913")
+	if err != nil {
+		t.Fatalf("callback port still held after quiesce: %v", err)
+	}
+	listener.Close()
+	callLifecycle(t, instance, pluginabi.MethodPluginReconfigure, request)
+	start()
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:37913", time.Second)
+	if err != nil {
+		t.Fatalf("listener did not restart: %v", err)
+	}
+	conn.Close()
+}
+
+func TestRaccoonCallbackExpiryAndInstanceIsolation(t *testing.T) {
+	var old, current raccoon.CallbackCatcher
+	defer old.Stop()
+	defer current.Stop()
+	handler := func(context.Context, string, string) (string, error) { return "<script>fixture</script>", nil }
+	if !old.Start("state-fixture", 20*time.Millisecond, handler) {
+		t.Fatal("start expired fixture")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		listener, err := net.Listen("tcp", "127.0.0.1:37913")
+		if err == nil {
+			listener.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expired listener still held: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !current.Start("state-fixture", time.Minute, handler) {
+		t.Fatal("new instance did not acquire port")
+	}
+	old.Stop() // a retired instance must not close the current listener.
+	client := &http.Client{Transport: &http.Transport{Proxy: nil}, Timeout: time.Second}
+	defer client.CloseIdleConnections()
+	for _, state := range []string{"wrong-state", "state-fixture"} {
+		resp, err := client.Get(raccoon.CallbackURL() + "?code=CODE_FIXTURE&state=" + state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if state == "wrong-state" {
+			if resp.StatusCode != 400 {
+				t.Fatalf("invalid state accepted: %d", resp.StatusCode)
+			}
+		} else if resp.StatusCode != 200 || strings.Contains(string(body), "<script>") || !strings.Contains(string(body), "&lt;script&gt;") {
+			t.Fatalf("callback result not rendered as text: %d %s", resp.StatusCode, body)
+		}
 	}
 }

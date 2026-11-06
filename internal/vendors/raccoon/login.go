@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/http"
@@ -249,71 +250,90 @@ func CallbackURL() string {
 type catcher struct {
 	server  *http.Server
 	state   string
-	onCode  func(code, state string) (string, error)
+	onCode  func(context.Context, string, string) (string, error)
+	cancel  context.CancelFunc
 	once    sync.Once
 	stopped chan struct{}
+	owner   *CallbackCatcher
 }
 
-var (
-	catcherMu sync.Mutex
-	active    *catcher
-)
+// CallbackCatcher owns a single instance's temporary loopback listener.
+// It is closed on successful callback, expiry, or plugin quiesce.
+type CallbackCatcher struct {
+	mu     sync.Mutex
+	active *catcher
+}
 
-// StartCallbackCatcher 为指定 state 启动回调监听。
-//
-// 端口被占、或已有监听在跑时返回 false，调用方据此退回「粘贴链接」流程，
-// 不影响登录本身。
-func StartCallbackCatcher(state string, onCode func(code, state string) (string, error)) bool {
-	catcherMu.Lock()
-	defer catcherMu.Unlock()
-	if active != nil {
+func (m *CallbackCatcher) Start(state string, ttl time.Duration, onCode func(context.Context, string, string) (string, error)) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.active != nil {
 		return false
 	}
-	listener, errListen := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", CallbackPort))
-	if errListen != nil {
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", CallbackPort))
+	if err != nil {
 		return false
 	}
-	current := &catcher{state: state, onCode: onCode, stopped: make(chan struct{})}
+	ctx, cancel := context.WithTimeout(context.Background(), ttl)
+	current := &catcher{state: state, onCode: onCode, cancel: cancel, stopped: make(chan struct{}), owner: m}
 	mux := http.NewServeMux()
 	mux.HandleFunc(CallbackPath, current.handle)
-	current.server = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	active = current
+	current.server = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second,
+		BaseContext: func(net.Listener) context.Context { return ctx }}
+	m.active = current
+	go func() { _ = current.server.Serve(listener); close(current.stopped) }()
 	go func() {
-		_ = current.server.Serve(listener)
-		close(current.stopped)
+		select {
+		case <-ctx.Done():
+			m.stop(current)
+		case <-current.stopped:
+			cancel()
+		}
 	}()
 	return true
 }
 
-// StopCallbackCatcher 结束当前监听（幂等）。
-func StopCallbackCatcher() {
-	catcherMu.Lock()
-	current := active
-	active = nil
-	catcherMu.Unlock()
-	if current == nil {
+func (m *CallbackCatcher) Stop() {
+	m.mu.Lock()
+	current := m.active
+	m.mu.Unlock()
+	if current != nil {
+		m.stop(current)
+	}
+}
+
+func (m *CallbackCatcher) stop(current *catcher) {
+	m.mu.Lock()
+	if m.active != current {
+		m.mu.Unlock()
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_ = current.server.Shutdown(ctx)
+	current.cancel()
+	_ = current.server.Close()
+	m.active = nil
+	m.mu.Unlock()
+	<-current.stopped
 }
 
 func (c *catcher) handle(writer http.ResponseWriter, request *http.Request) {
 	query := request.URL.Query()
 	code := strings.TrimSpace(query.Get("code"))
 	state := strings.TrimSpace(query.Get("state"))
-	if code == "" {
-		writeCallbackPage(writer, http.StatusBadRequest, "回调缺少 code，请回到控制台重新发起登录。")
+	if code == "" || state != c.state {
+		writeCallbackPage(writer, http.StatusBadRequest, "回调 code 或 state 无效，请回到控制台重新发起登录。")
 		return
 	}
-	message, errComplete := c.onCode(code, state)
-	if errComplete != nil {
-		writeCallbackPage(writer, http.StatusBadRequest, "登录失败："+errComplete.Error())
+	message, err := c.onCode(request.Context(), code, state)
+	if err != nil {
+		writeCallbackPage(writer, http.StatusBadRequest, "登录失败："+err.Error())
 		return
 	}
 	writeCallbackPage(writer, http.StatusOK, message)
-	c.once.Do(func() { go StopCallbackCatcher() })
+	// Flush the response before closing the one-shot listener.
+	if flusher, ok := writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	c.once.Do(func() { go c.owner.stop(c) })
 }
 
 // writeCallbackPage 渲染结果页。只写纯静态文本，不回显任何请求参数。
@@ -324,6 +344,6 @@ func writeCallbackPage(writer http.ResponseWriter, status int, message string) {
 		"<title>小浣熊登录</title><style>body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;" +
 		"background:#0f1115;color:#e6e8ee;display:flex;align-items:center;justify-content:center;" +
 		"height:100vh;margin:0}div{text-align:center;line-height:1.8}h1{font-size:18px;font-weight:600}" +
-		"p{color:#9aa3b2;font-size:14px}</style></head><body><div><h1>" + message + "</h1>" +
-		"<p>可以关闭此页面，回到控制台查看账号。</p></div></body></html>"))
+		"p{color:#9aa3b2;font-size:14px}</style></head><body><div><h1>" + html.EscapeString(message) + "</h1>" +
+		"<p>请回到原控制台查看账号；保存报错时，将本页地址粘贴回登录窗口重试。</p></div></body></html>"))
 }
