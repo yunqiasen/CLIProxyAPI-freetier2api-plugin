@@ -1,6 +1,7 @@
 package state
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -225,5 +226,31 @@ func TestSnapshotCopiesCheckinHistory(t *testing.T) {
 	got := store.Snapshot().CheckinHistory[key]
 	if len(got) != 1 || got[0].Status != "success" {
 		t.Fatalf("snapshot 与内部状态共享了历史切片: %#v", got)
+	}
+}
+
+func TestStorePreservesLegacyPromptModeForRollback(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"prompt_mode":"preserve","account_aliases":{"fixture":"显示名"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore()
+	store.Configure(dir)
+	if _, err := store.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store.Mutate(func(s *State) { s.ModelNameTag = "suffix" })
+	store.Flush()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["prompt_mode"] != "preserve" {
+		t.Fatalf("legacy setting lost on save: %s", raw)
 	}
 }

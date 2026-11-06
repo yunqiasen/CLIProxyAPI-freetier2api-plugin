@@ -113,6 +113,9 @@ type State struct {
 	// ModelNameTag 是页面上改过的模型名渠道标识模式（off/prefix/suffix）；
 	// 空表示沿用 YAML 配置。
 	ModelNameTag string `json:"model_name_tag,omitempty"`
+	// Deprecated: preserve the previous release's setting for rollback only.
+	// The current release no longer applies prompt filtering.
+	PromptMode string `json:"prompt_mode,omitempty"`
 
 	// AutoRaccoonDailyGrant 开启小浣熊「每日积分」任务（网页端 setting_info）。
 	// nil = 未设置，回落配置默认值。
