@@ -169,6 +169,10 @@ func CheckinAutoTask(ctx context.Context, vendor Vendor, cred *Credential) *Auto
 	if res == nil {
 		return nil
 	}
+	if res.NotRecorded {
+		return &AutoTaskResult{Code: AutoTaskCodeCheckin, Status: "skipped",
+			Message: FirstNonEmpty(res.Message, "本次未确认领取")}
+	}
 	status := "done"
 	if res.Already {
 		status = "skipped"

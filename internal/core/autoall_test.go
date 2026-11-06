@@ -129,3 +129,19 @@ func TestCheckinAutoTaskReportsError(t *testing.T) {
 		t.Fatalf("错误应折叠成 error 行，得到 %+v", row)
 	}
 }
+
+func TestCheckinAutoTaskDoesNotCountUnconfirmedRewards(t *testing.T) {
+	for _, message := range []string{"签到窗口未开启", ""} {
+		vendor := &stubCheckin{supports: true, result: &CheckinResult{NotRecorded: true, Message: message, Credit: 100, Energy: 5}}
+		row := CheckinAutoTask(context.Background(), vendor, &Credential{})
+		if row == nil || row.Status != "skipped" || row.Credit != 0 || row.Energy != 0 {
+			t.Fatalf("unconfirmed reward counted: %+v", row)
+		}
+		if message != "" && row.Message != message {
+			t.Fatalf("lost message: %+v", row)
+		}
+		if message == "" && row.Message != "本次未确认领取" {
+			t.Fatalf("false success message: %+v", row)
+		}
+	}
+}
